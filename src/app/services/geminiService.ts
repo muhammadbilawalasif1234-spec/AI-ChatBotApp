@@ -5,7 +5,7 @@ export interface GeminiMessage {
   text: string;
 }
 
-const GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY';
+const GEMINI_API_KEY = 'GEMINI_API_KEY';
 
 export async function sendMessageToGemini(messages: GeminiMessage[]): Promise<string> {
   try {
