@@ -1,0 +1,10 @@
+{
+  "extends": "@react-native/typescript-config",
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"],
+      "@app-kit": ["./src/app-kit/index.ts"],
+      "@app-kit/*": ["./src/app-kit/*"]
+    }
+  }
+}

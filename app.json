@@ -1,0 +1,12 @@
+{
+  "name": "MyReactNativeTemplate",
+  "slug": "myreactnativetemplate",
+  "plugins": [
+    [
+      "react-native-google-mobile-ads",
+      {
+        "androidAppId": "ca-app-pub-3940256099942544~3375251506"
+      }
+    ]
+  ]
+}
