@@ -1,53 +1,42 @@
-// @ts-ignore
-import analytics from '@react-native-firebase/analytics';
+// src/app-kit/analytics/AnalyticsManager.ts
+
+type EventParams = Record<string, string | number | boolean | null | undefined>;
 
 class AnalyticsManager {
-  /**
-   * Log a custom event with optional parameters
-   */
-  public async logEvent(eventName: string, params?: Record<string, any>): Promise<void> {
-    try {
-      await analytics().logEvent(eventName, params);
-      console.log(`[AnalyticsManager] Event logged: "${eventName}"`, params || '');
-    } catch (error) {
-      console.error(`[AnalyticsManager] Error logging event "${eventName}":`, error);
-    }
+  private isEnabled = true;
+
+  setEnabled(enabled: boolean): void {
+    this.isEnabled = enabled;
   }
 
-  /**
-   * Track specific screen views
-   */
-  public async logScreenView(screenName: string, screenClass: string): Promise<void> {
-    try {
-      await analytics().logScreenView({
-        screen_name: screenName,
-        screen_class: screenClass,
-      });
-      console.log(`[AnalyticsManager] Screen tracked: "${screenName}"`);
-    } catch (error) {
-      console.error(`[AnalyticsManager] Error tracking screen "${screenName}":`, error);
+  async logEvent(eventName: string, params?: EventParams): Promise<void> {
+    if (!this.isEnabled || !eventName) {
+      return;
     }
-  }
 
-  /**
-   * Set User ID for tracking specific user sessions
-   */
-  public async setUserId(userId: string): Promise<void> {
     try {
-      await analytics().setUserId(userId);
-    } catch (error) {
-      console.error('[AnalyticsManager] Error setting user ID:', error);
-    }
-  }
+      const sanitizedParams: Record<string, string | number | boolean> = {};
+      if (params && typeof params === 'object') {
+        Object.entries(params).forEach(([key, value]) => {
+          if (value !== undefined && value !== null) {
+            sanitizedParams[key] = value;
+          }
+        });
+      }
 
-  /**
-   * Set User Properties (e.g., premium status, theme preference)
-   */
-  public async setUserProperty(name: string, value: string): Promise<void> {
-    try {
-      await analytics().setUserProperty(name, value);
+      // If you wire up a custom sink or analytics SDK later, guard the call like this:
+      const externalLogger = (globalThis as { __APP_ANALYTICS_LOGGER__?: unknown })
+        .__APP_ANALYTICS_LOGGER__;
+      if (typeof externalLogger === 'function') {
+        await (externalLogger as (name: string, data: Record<string, string | number | boolean>) => void | Promise<void>)(
+          eventName,
+          sanitizedParams
+        );
+      }
     } catch (error) {
-      console.error(`[AnalyticsManager] Error setting user property "${name}":`, error);
+      if (__DEV__) {
+        console.warn(`[AnalyticsManager] Skipped event "${eventName}":`, error);
+      }
     }
   }
 }

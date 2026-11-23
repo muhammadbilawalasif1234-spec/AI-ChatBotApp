@@ -1,6 +1,5 @@
 // src/app/ads/NativeAdModal.tsx
 
-import React from 'react';
 import {
   Modal,
   View,
@@ -9,6 +8,7 @@ import {
   TouchableOpacity,
   Dimensions,
   TouchableWithoutFeedback,
+  Platform,
 } from 'react-native';
 import { TestIds } from 'react-native-google-mobile-ads';
 

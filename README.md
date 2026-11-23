@@ -21,6 +21,24 @@ A cross-platform mobile AI assistant built with **React Native CLI** and **TypeS
 
 ---
 
+## 🔑 Gemini API setup
+
+Create `src/app/config/secrets.local.ts` before building the app:
+
+```ts
+export const GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY';
+```
+
+This local file is git-ignored. Restart Metro and rebuild the app after changing
+the key. The chat uses Gemini 3.5 Flash-Lite first and falls back to other
+supported Gemini models when a model is unavailable or temporarily rate-limited.
+
+An API key embedded in a mobile app can be extracted from its bundle. Restrict
+the key in Google AI Studio/Google Cloud and use a server-side proxy for
+production apps; never commit a real key.
+
+---
+
 ## 📱 Screenshots
 
 | Onboarding | Home & AI Personas | AI Chat Screen |

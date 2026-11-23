@@ -11,9 +11,11 @@ import {
   finishTransaction,
   purchaseUpdatedListener,
   purchaseErrorListener,
+  ErrorCode,
   type Purchase,
   type PurchaseError,
   type ProductSubscription,
+  type SubscriptionOffer,
 } from 'react-native-iap';
 
 const PRO_STORAGE_KEY = '@aichat_pro_entitlement';
@@ -25,12 +27,46 @@ export const SUBSCRIPTION_SKUS = Platform.select({
 });
 
 type StatusListener = (isPro: boolean) => void;
+type GooglePlayPurchaseListener = (sku: string) => void;
+
+function getOfferTokenForPlan(
+  product: ProductSubscription | undefined,
+  sku: string
+): string | undefined {
+  if (!product) return undefined;
+
+  const offers: SubscriptionOffer[] = product.subscriptionOffers || [];
+  const expectedPeriod = sku === 'pro_annual_3999' ? 'P1Y' : 'P1W';
+  const hasPaidRecurringPhase = (offer: SubscriptionOffer) =>
+    (offer.pricingPhasesAndroid?.pricingPhaseList || []).some(
+      (phase) =>
+        phase.billingPeriod === expectedPeriod &&
+        Number.isFinite(Number(phase.priceAmountMicros)) &&
+        Number(phase.priceAmountMicros) > 0 &&
+        phase.recurrenceMode !== 3
+    );
+  const matchingOffer =
+    offers.find(
+      (offer) =>
+        hasPaidRecurringPhase(offer) &&
+        offer.pricingPhasesAndroid?.pricingPhaseList?.some(
+          (phase) =>
+            phase.billingPeriod === expectedPeriod &&
+            phase.recurrenceMode === 1 &&
+            Number(phase.priceAmountMicros) > 0
+        )
+    ) || offers.find(hasPaidRecurringPhase);
+
+  const token = matchingOffer?.offerTokenAndroid;
+  return token || undefined;
+}
 
 class BillingService {
   private isConnected = false;
   private isPro = false;
   private cachedSubscriptions: ProductSubscription[] = [];
   private listeners: Set<StatusListener> = new Set();
+  private googlePlayPurchaseListeners: Set<GooglePlayPurchaseListener> = new Set();
   private purchaseUpdateSub: ReturnType<typeof purchaseUpdatedListener> | null = null;
   private purchaseErrorSub: ReturnType<typeof purchaseErrorListener> | null = null;
 
@@ -56,14 +92,29 @@ class BillingService {
   }
 
   private attachListeners(): void {
+    if (this.purchaseUpdateSub && this.purchaseErrorSub) return;
     this.removeListeners();
 
     this.purchaseUpdateSub = purchaseUpdatedListener(async (purchase: Purchase) => {
       try {
-        const receipt = purchase.transactionReceipt || (purchase as any).purchaseToken;
+        if (
+          purchase.purchaseState !== 'purchased' ||
+          !SUBSCRIPTION_SKUS.includes(purchase.productId)
+        ) {
+          return;
+        }
+
+        const receipt =
+          ('transactionReceipt' in purchase && purchase.transactionReceipt) ||
+          ('purchaseToken' in purchase && purchase.purchaseToken);
         if (receipt) {
           await finishTransaction({ purchase, isConsumable: false });
           await this.grantProAccess();
+          if (purchase.store === 'google' || purchase.storeId === 'play') {
+            this.googlePlayPurchaseListeners.forEach((listener) => {
+              listener(purchase.productId);
+            });
+          }
         }
       } catch (err) {
         console.warn('[BillingService] Error finishing transaction:', err);
@@ -71,7 +122,7 @@ class BillingService {
     });
 
     this.purchaseErrorSub = purchaseErrorListener((error: PurchaseError) => {
-      if (error.code !== 'E_USER_CANCELLED') {
+      if (error.code !== ErrorCode.UserCancelled) {
         console.warn('[BillingService] Purchase listener error:', error.message);
       }
     });
@@ -99,17 +150,22 @@ class BillingService {
         this.isConnected = Boolean(connected);
       }
 
-      if (!this.isConnected) return [];
+      if (!this.isConnected) {
+        this.cachedSubscriptions = [];
+        return this.cachedSubscriptions;
+      }
 
+      this.attachListeners();
       const products = await fetchProducts({
         skus: SUBSCRIPTION_SKUS,
         type: 'subs',
       });
 
-      this.cachedSubscriptions = (products as ProductSubscription[]) || [];
+      this.cachedSubscriptions = (products as ProductSubscription[] | null) || [];
       return this.cachedSubscriptions;
     } catch (error) {
       console.warn('[BillingService] Could not fetch store subscriptions:', error);
+      this.cachedSubscriptions = [];
       return [];
     }
   }
@@ -121,28 +177,26 @@ class BillingService {
         this.isConnected = Boolean(connected);
       } catch {}
     }
+    if (this.isConnected) this.attachListeners();
 
-    // Attempt to resolve offerToken from cached store products if not explicitly passed
+    // Resolve the matching paid plan offer when the caller has not supplied its token.
     let resolvedOfferToken = passedOfferToken;
-    if (!resolvedOfferToken && this.cachedSubscriptions.length > 0) {
-      const matched: any = this.cachedSubscriptions.find((p: any) => p.productId === sku || p.id === sku);
-      const offers = matched?.subscriptionOfferDetails || matched?.subscriptionOfferDetailsAndroid;
-      if (offers && offers.length > 0) {
-        resolvedOfferToken = offers[0].offerToken;
-      }
+    if (!resolvedOfferToken) {
+      const matched = this.cachedSubscriptions.find((product) => product.id === sku);
+      resolvedOfferToken = getOfferTokenForPlan(matched, sku);
     }
 
     // Production / Play Store Internal Testing Path
     if (this.isConnected && (Platform.OS !== 'android' || resolvedOfferToken)) {
       await requestPurchase({
         request: {
-          android: {
+          google: {
             skus: [sku],
             subscriptionOffers: resolvedOfferToken
               ? [{ sku, offerToken: resolvedOfferToken }]
               : [],
           },
-          ios: {
+          apple: {
             sku,
           },
         },
@@ -220,6 +274,15 @@ class BillingService {
     listener(this.isPro);
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  subscribeToGooglePlayPurchase(
+    listener: GooglePlayPurchaseListener
+  ): () => void {
+    this.googlePlayPurchaseListeners.add(listener);
+    return () => {
+      this.googlePlayPurchaseListeners.delete(listener);
     };
   }
 }

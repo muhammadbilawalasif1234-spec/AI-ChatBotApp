@@ -1,6 +1,6 @@
 // src/app/screens/NanoBananaScreen.tsx
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   StyleSheet,
   Text,
@@ -8,6 +8,7 @@ import {
   StatusBar,
   ScrollView,
   Image,
+  TextInput,
   TouchableOpacity,
   ActivityIndicator,
   Modal,
@@ -16,7 +17,8 @@ import {
   PermissionsAndroid,
   Platform,
 } from 'react-native';
-import { launchCamera, launchImageLibrary } from 'react-native-image-picker';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { launchCamera, launchImageLibrary, Asset } from 'react-native-image-picker';
 import {
   BannerAd,
   BannerAdSize,
@@ -25,42 +27,145 @@ import {
   AdEventType,
 } from 'react-native-google-mobile-ads';
 import { useTheme } from '../../app-kit/theme/useTheme';
-import { sendMessageToGemini } from '../services/geminiService';
+import {
+  buildUserDirectedImageEditPrompt,
+  editImageWithGemini,
+  imageUriToBase64,
+} from '../services/geminiService';
+import { AdBlockManager } from '../../app-kit/ads/AdBlockManager';
 
 interface NanoBananaScreenProps {
   onBack: () => void;
-  libraryItems: GeneratedItem[];
-  onUpdateLibrary: (items: GeneratedItem[]) => void;
+  libraryItems?: GeneratedItem[];
+  onUpdateLibrary?: (items: GeneratedItem[]) => void;
+  onOpenChatWithPrompt?: (topic: string, starterPrompt: string) => void;
 }
 
-interface StyleOption {
+interface EditPreset {
   id: string;
   name: string;
-  tag: string;
+  subtitle: string;
+  promptDirective: string;
+  accentColor: string;
 }
 
 export interface GeneratedItem {
   id: string;
+  styleId: string;
   styleName: string;
+  specialistRole?: string;
+  editRequirements?: string;
+  sourceImageUri: string;
+  sourceImageMimeType?: string;
+  editedImageUri: string;
   imageUri: string;
+  accentColor?: string;
+  tintColor?: string;
+  borderFrameColor?: string;
   aiDescription: string;
   timestamp: string;
 }
 
-const STYLES: StyleOption[] = [
-  { id: 'default', name: 'Default AI Enhance', tag: 'Natural AI' },
-  { id: 'chronicle', name: 'Chronicle Story Art', tag: 'Story Art' },
-  { id: 'monolith', name: 'Monolith 3D Sculpture', tag: '3D Sculpture' },
-  { id: 'forge', name: 'Cyberpunk Studio', tag: 'Cyber Studio' },
+const NANO_LIBRARY_STORAGE_KEY = '@ai_chat_assistant:nano_banana_library_v1';
+
+const QUICK_REQUIREMENTS = [
+  'Brighten & sharpen',
+  'Warm golden light',
+  'Clean studio look',
+  'High contrast & clarity',
 ];
 
-export default function NanoBananaScreen({ onBack, libraryItems, onUpdateLibrary }: NanoBananaScreenProps) {
+const EDIT_PRESETS: EditPreset[] = [
+  {
+    id: 'retouch',
+    name: 'Smart Retouch',
+    subtitle: 'Natural clarity & balance',
+    promptDirective:
+      'professional photo editing, natural exposure balance, crisp detail, clean color correction',
+    accentColor: '#10B981',
+  },
+  {
+    id: 'cinematic',
+    name: 'Cinematic Grade',
+    subtitle: 'Rich depth & warm tones',
+    promptDirective:
+      'cinematic color grading, rich tonal depth, soft film highlights, balanced shadows',
+    accentColor: '#F59E0B',
+  },
+  {
+    id: 'studio_3d',
+    name: '3D Studio Polish',
+    subtitle: 'Sculpted lighting & form',
+    promptDirective:
+      '3d studio render lighting, clean rim light, sharp edges, high-detail product/portrait finish',
+    accentColor: '#3B82F6',
+  },
+  {
+    id: 'cyber_neon',
+    name: 'Neon Studio',
+    subtitle: 'Bold contrast & vivid accents',
+    promptDirective:
+      'modern studio lighting, subtle cyan and magenta rim highlights, punchy contrast, crisp focus',
+    accentColor: '#A855F7',
+  },
+];
+
+export default function NanoBananaScreen({
+  onBack,
+  libraryItems: externalLibrary,
+  onUpdateLibrary,
+  onOpenChatWithPrompt,
+}: NanoBananaScreenProps) {
   const { colors, isDarkMode } = useTheme();
-  const [selectedStyle, setSelectedStyle] = useState<string>('default');
+  const [localLibrary, setLocalLibrary] = useState<GeneratedItem[]>([]);
+  const libraryItems = externalLibrary ?? localLibrary;
+
+  const updateLibrary = (next: GeneratedItem[]) => {
+    if (onUpdateLibrary) {
+      onUpdateLibrary(next);
+    } else {
+      setLocalLibrary(next);
+    }
+    AsyncStorage.setItem(NANO_LIBRARY_STORAGE_KEY, JSON.stringify(next)).catch(() => {});
+  };
+
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+  const [editRequirements, setEditRequirements] = useState<string>('');
   const [selectedImageUri, setSelectedImageUri] = useState<string | null>(null);
+  const [selectedImageMimeType, setSelectedImageMimeType] = useState('image/jpeg');
+  const [selectedImageMeta, setSelectedImageMeta] = useState<string | null>(null);
+  const [latestItem, setLatestItem] = useState<GeneratedItem | null>(null);
   const [isLoadingAd, setIsLoadingAd] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [previewItem, setPreviewItem] = useState<GeneratedItem | null>(null);
+  const [modalViewMode, setModalViewMode] = useState<'compare' | 'edited'>('compare');
+  const [isAdsBlocked, setIsAdsBlocked] = useState<boolean>(() => AdBlockManager.isEnabled());
+  const [editedImageLoadingMap, setEditedImageLoadingMap] = useState<Record<string, boolean>>({});
+  const [editedImageErrorMap, setEditedImageErrorMap] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (!externalLibrary) {
+      AsyncStorage.getItem(NANO_LIBRARY_STORAGE_KEY)
+        .then((raw) => {
+          if (!raw) return;
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            setLocalLibrary(parsed);
+            setLatestItem((prev) => prev ?? parsed[0] ?? null);
+          }
+        })
+        .catch(() => {});
+    } else if (externalLibrary.length > 0 && !latestItem) {
+      setLatestItem(externalLibrary[0]);
+    }
+  }, [externalLibrary, latestItem]);
+
+  useEffect(() => {
+    const unsubscribe = AdBlockManager.subscribe((blocked) => {
+      setIsAdsBlocked(blocked);
+    });
+    return () => unsubscribe();
+  }, []);
 
   const requestCameraPermission = async () => {
     if (Platform.OS !== 'android') return true;
@@ -69,111 +174,246 @@ export default function NanoBananaScreen({ onBack, libraryItems, onUpdateLibrary
         PermissionsAndroid.PERMISSIONS.CAMERA,
         {
           title: 'Camera Permission',
-          message: 'App needs access to your camera to take photos.',
+          message: 'Allow camera access to capture a photo for editing.',
           buttonNeutral: 'Ask Me Later',
           buttonNegative: 'Cancel',
           buttonPositive: 'OK',
         }
       );
       return granted === PermissionsAndroid.RESULTS.GRANTED;
-    } catch (err) {
+    } catch {
       return false;
     }
+  };
+
+  const applySelectedAsset = (asset?: Asset) => {
+    if (!asset?.uri) return;
+    setSelectedImageUri(asset.uri);
+    setSelectedImageMimeType(asset.type || 'image/jpeg');
+    if (asset.width && asset.height) {
+      setSelectedImageMeta(`${asset.width} × ${asset.height}`);
+    } else {
+      setSelectedImageMeta(null);
+    }
+  };
+
+  const handleClearSourcePhoto = () => {
+    setSelectedImageUri(null);
+    setSelectedImageMimeType('image/jpeg');
+    setSelectedImageMeta(null);
   };
 
   const handleOpenCamera = async () => {
     const hasPermission = await requestCameraPermission();
     if (!hasPermission) {
-      Alert.alert('Camera Permission Needed', 'Please allow camera access in settings.');
+      Alert.alert('Camera Permission Needed', 'Please enable camera permission in device settings.');
       return;
     }
 
     launchCamera(
-      { mediaType: 'photo', quality: 0.9, saveToPhotos: true },
+      {
+        mediaType: 'photo',
+        quality: 0.9,
+        maxWidth: 1536,
+        maxHeight: 1536,
+        saveToPhotos: true,
+      },
       (response) => {
         if (response.didCancel) return;
         if (response.errorCode) {
-          Alert.alert('Camera Error', response.errorMessage || 'Could not open camera.');
+          Alert.alert('Camera Error', response.errorMessage || 'Unable to open camera.');
           return;
         }
-        if (response.assets && response.assets.length > 0 && response.assets[0].uri) {
-          setSelectedImageUri(response.assets[0].uri);
-        }
+        applySelectedAsset(response.assets?.[0]);
       }
     );
   };
 
   const handleOpenGallery = () => {
     launchImageLibrary(
-      { mediaType: 'photo', quality: 0.9, selectionLimit: 1 },
+      {
+        mediaType: 'photo',
+        quality: 0.9,
+        maxWidth: 1536,
+        maxHeight: 1536,
+        selectionLimit: 1,
+      },
       (response) => {
         if (response.didCancel) return;
         if (response.errorCode) {
           Alert.alert('Gallery Error', response.errorMessage || 'Unable to open gallery.');
           return;
         }
-        if (response.assets && response.assets.length > 0 && response.assets[0].uri) {
-          setSelectedImageUri(response.assets[0].uri);
-        }
+        applySelectedAsset(response.assets?.[0]);
       }
     );
   };
 
-  // Professional Clear / Delete Library Handler with Confirmation
-  const handleClearLibrary = () => {
+  const appendQuickRequirement = (presetLabel: string) => {
+    setEditRequirements((prev) => {
+      const cleanPrev = prev.trim();
+      if (!cleanPrev) return presetLabel;
+      const tokens = cleanPrev.split(',').map((t) => t.trim().toLowerCase());
+      if (tokens.includes(presetLabel.toLowerCase())) return cleanPrev;
+      return `${cleanPrev}, ${presetLabel.toLowerCase()}`;
+    });
+  };
+
+  const handleReuseItemSettings = (item: GeneratedItem) => {
+    setSelectedPresetId(
+      EDIT_PRESETS.some((preset) => preset.id === item.styleId)
+        ? item.styleId
+        : null
+    );
+    setEditRequirements(item.editRequirements || '');
+    if (item.sourceImageUri) {
+      setSelectedImageUri(item.sourceImageUri);
+      setSelectedImageMimeType(item.sourceImageMimeType || 'image/jpeg');
+    }
+    setPreviewItem(null);
+  };
+
+  const handleRefineInChat = (item: GeneratedItem) => {
+    if (!onOpenChatWithPrompt) return;
+    const starterPrompt = [
+      `Help me refine this photo edit (${item.styleName}).`,
+      item.editRequirements ? `My edit requirements: "${item.editRequirements}".` : '',
+      `Current edit notes: ${item.aiDescription}`,
+      'Suggest ways to improve the prompt, lighting, and visual polish.',
+    ]
+      .filter(Boolean)
+      .join(' ');
+    setPreviewItem(null);
+    onOpenChatWithPrompt('Nano Banana Edit Assistant', starterPrompt);
+  };
+
+  const handleDeleteItem = (id: string) => {
     Alert.alert(
-      'Clear Gallery Library',
-      'Are you sure you want to delete all generated AI items?',
+      'Delete Edit',
+      'Remove this edited photo from your library?',
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: 'Clear',
+          text: 'Delete',
           style: 'destructive',
           onPress: () => {
-            onUpdateLibrary([]);
+            const next = libraryItems.filter((item) => item.id !== id);
+            updateLibrary(next);
+            if (previewItem?.id === id) {
+              setPreviewItem(null);
+            }
+            if (latestItem?.id === id) {
+              setLatestItem(next[0] || null);
+            }
           },
         },
       ]
     );
   };
 
-  const processRealAiGeneration = async () => {
-    if (!selectedImageUri) return;
+  const handleClearLibrary = () => {
+    Alert.alert(
+      'Clear Library',
+      'Delete all saved edits in Nano Banana?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear All',
+          style: 'destructive',
+          onPress: () => {
+            updateLibrary([]);
+            setPreviewItem(null);
+            setLatestItem(null);
+          },
+        },
+      ]
+    );
+  };
+
+  const runImageEdit = async () => {
+    if (!selectedImageUri || isGenerating) return;
+
+    const trimmedRequirements = editRequirements.trim();
+    if (!trimmedRequirements) {
+      Alert.alert(
+        'Edit Requirements Needed',
+        'Please enter what changes you want applied to your photo (or tap one of the quick presets).'
+      );
+      return;
+    }
+
     setIsGenerating(true);
 
-    const activeStyleObj = STYLES.find((s) => s.id === selectedStyle) || STYLES[0];
+    const activePreset =
+      EDIT_PRESETS.find((preset) => preset.id === selectedPresetId) || null;
+    const itemId = Date.now().toString();
+    setEditedImageLoadingMap((prev) => ({ ...prev, [itemId]: true }));
+    setEditedImageErrorMap((prev) => ({ ...prev, [itemId]: false }));
 
     try {
-      // Call Gemini API for real AI analysis and creative transformation description based on style
-      const promptText = `Analyze this uploaded photo context and provide a professional creative transformation report for a "${activeStyleObj.name}" style. Give lighting details, mood adjustment, and artistic feedback.`;
-      
-      const aiResponse = await sendMessageToGemini([
-        { role: 'user', text: promptText }
-      ]);
+      const promptText = buildUserDirectedImageEditPrompt(
+        trimmedRequirements,
+        activePreset?.promptDirective
+      );
 
-      const now = new Date();
-      const formattedTime = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const imageBase64 = await imageUriToBase64(selectedImageUri);
+      const result = await editImageWithGemini(
+        imageBase64,
+        selectedImageMimeType,
+        promptText
+      );
 
-      const newArtwork: GeneratedItem = {
-        id: Date.now().toString(),
-        styleName: activeStyleObj.name,
-        imageUri: selectedImageUri,
-        aiDescription: aiResponse,
-        timestamp: formattedTime,
+      const timestamp = new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+
+      const editedEntry: GeneratedItem = {
+        id: itemId,
+        styleId: activePreset?.id || 'custom',
+        styleName: activePreset?.name || 'Custom Edit',
+        specialistRole: activePreset?.subtitle,
+        editRequirements: trimmedRequirements,
+        sourceImageUri: selectedImageUri,
+        sourceImageMimeType: selectedImageMimeType,
+        editedImageUri: result.imageUri,
+        imageUri: result.imageUri,
+        accentColor: activePreset?.accentColor,
+        aiDescription: result.description,
+        timestamp,
       };
 
-      onUpdateLibrary([newArtwork, ...libraryItems]);
-      setPreviewItem(newArtwork);
-    } catch (error: any) {
-      Alert.alert('AI Processing Error', error?.message || 'Unable to connect to Gemini AI service.');
+      const nextLibrary = [editedEntry, ...libraryItems];
+      updateLibrary(nextLibrary);
+      setLatestItem(editedEntry);
+      setModalViewMode('compare');
+      setPreviewItem(editedEntry);
+    } catch (error) {
+      Alert.alert(
+        'Photo Edit Failed',
+        error instanceof Error ? error.message : 'Could not edit this photo. Please try again.'
+      );
     } finally {
       setIsGenerating(false);
     }
   };
 
-  const handleGenerate = () => {
+  const handleApplyEdit = () => {
     if (!selectedImageUri) {
-      Alert.alert('Select Photo', 'Please capture or select an image from gallery first.');
+      Alert.alert('Select Photo', 'Please pick a photo from Gallery or capture one with Camera first.');
+      return;
+    }
+
+    if (!editRequirements.trim()) {
+      Alert.alert(
+        'Enter Edit Requirements',
+        'Describe the edit you want on your photo before generating.'
+      );
+      return;
+    }
+
+    if (AdBlockManager.isEnabled()) {
+      void runImageEdit();
       return;
     }
 
@@ -183,67 +423,122 @@ export default function NanoBananaScreen({ onBack, libraryItems, onUpdateLibrary
         requestNonPersonalizedAdsOnly: true,
       });
 
-      let isResolved = false;
+      let settled = false;
 
-      const safetyTimeout = setTimeout(() => {
-        if (!isResolved) {
-          isResolved = true;
-          setIsLoadingAd(false);
-          processRealAiGeneration();
-        }
-      }, 2500);
+      const finishAndEdit = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        setIsLoadingAd(false);
+        void runImageEdit();
+      };
 
-      const unsubscribeLoaded = interstitial.addAdEventListener(AdEventType.LOADED, () => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(safetyTimeout);
-          setIsLoadingAd(false);
-          interstitial.show();
-        }
+      const timeoutId = setTimeout(finishAndEdit, 2500);
+
+      const unsubLoaded = interstitial.addAdEventListener(AdEventType.LOADED, () => {
+        if (settled) return;
+        clearTimeout(timeoutId);
+        setIsLoadingAd(false);
+        interstitial.show();
       });
 
-      const unsubscribeClosed = interstitial.addAdEventListener(AdEventType.CLOSED, () => {
-        unsubscribeLoaded();
-        unsubscribeClosed();
-        processRealAiGeneration();
+      const unsubClosed = interstitial.addAdEventListener(AdEventType.CLOSED, () => {
+        unsubLoaded();
+        unsubClosed();
+        finishAndEdit();
       });
 
-      const unsubscribeError = interstitial.addAdEventListener(AdEventType.ERROR, () => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(safetyTimeout);
-          unsubscribeLoaded();
-          unsubscribeError();
-          setIsLoadingAd(false);
-          processRealAiGeneration();
-        }
+      const unsubError = interstitial.addAdEventListener(AdEventType.ERROR, () => {
+        unsubLoaded();
+        unsubError();
+        finishAndEdit();
       });
 
       interstitial.load();
-    } catch (e) {
+    } catch {
       setIsLoadingAd(false);
-      processRealAiGeneration();
+      void runImageEdit();
     }
   };
 
-  const handleShareArtwork = async (item: GeneratedItem) => {
+  const handleShareItem = async (item: GeneratedItem) => {
     try {
       await Share.share({
-        message: `My Nano Banana AI (${item.styleName}):\n\n${item.aiDescription}`,
+        message: [
+          `Nano Banana Photo Edit (${item.styleName})`,
+          item.editRequirements ? `Requirements: ${item.editRequirements}` : '',
+          `Edited Image: ${item.editedImageUri || item.imageUri}`,
+          '',
+          item.aiDescription,
+        ]
+          .filter(Boolean)
+          .join('\n'),
       });
-    } catch (e) {}
+    } catch {}
+  };
+
+  const retryEditedImageLoad = (itemId: string) => {
+    setEditedImageErrorMap((prev) => ({ ...prev, [itemId]: false }));
+    setEditedImageLoadingMap((prev) => ({ ...prev, [itemId]: true }));
+  };
+
+  const activePreset =
+    EDIT_PRESETS.find((preset) => preset.id === selectedPresetId) || null;
+
+  const renderEditedImage = (
+    item: GeneratedItem,
+    imageStyle: any,
+    showSpinner = true
+  ) => {
+    const uri = item.editedImageUri || item.imageUri;
+    const isImgLoading = !!editedImageLoadingMap[item.id];
+    const hasImgError = !!editedImageErrorMap[item.id];
+
+    return (
+      <View style={styles.imageHolder}>
+        <Image
+          source={{ uri: hasImgError ? item.sourceImageUri : uri }}
+          style={imageStyle}
+          onLoadStart={() =>
+            setEditedImageLoadingMap((prev) => ({ ...prev, [item.id]: true }))
+          }
+          onLoadEnd={() =>
+            setEditedImageLoadingMap((prev) => ({ ...prev, [item.id]: false }))
+          }
+          onError={() => {
+            setEditedImageLoadingMap((prev) => ({ ...prev, [item.id]: false }));
+            setEditedImageErrorMap((prev) => ({ ...prev, [item.id]: true }));
+          }}
+        />
+        {showSpinner && isImgLoading && (
+          <View style={styles.imageLoadingBadge}>
+            <ActivityIndicator size="small" color="#FFFFFF" />
+          </View>
+        )}
+        {hasImgError && (
+          <TouchableOpacity
+            style={styles.imageFallbackBar}
+            onPress={() => retryEditedImageLoad(item.id)}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.imageFallbackText}>Showing original • Tap to retry edit</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    );
   };
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
-      <StatusBar barStyle="light-content" backgroundColor="#000000" />
+      <StatusBar barStyle="light-content" />
 
-      {/* Header with Back Button, Title, and Clear Library Trash Button 🗑️ */}
       <View style={[styles.header, { borderBottomColor: colors.border }]}>
         <TouchableOpacity onPress={onBack} style={styles.backButton} activeOpacity={0.7}>
           <Text style={[styles.backArrow, { color: colors.text }]}>←</Text>
         </TouchableOpacity>
-        <Text style={[styles.headerTitle, { color: colors.text }]} numberOfLines={1}>Nano Banana AI</Text>
+        <Text style={[styles.headerTitle, { color: colors.text }]} numberOfLines={1}>
+          Nano Banana Editor
+        </Text>
         {libraryItems.length > 0 ? (
           <TouchableOpacity onPress={handleClearLibrary} style={styles.clearButton} activeOpacity={0.7}>
             <Text style={styles.clearButtonEmoji}>🗑️</Text>
@@ -254,68 +549,146 @@ export default function NanoBananaScreen({ onBack, libraryItems, onUpdateLibrary
       </View>
 
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-        <Text style={[styles.sectionHeading, { color: colors.text }]}>Upload Photo for Real AI Edit</Text>
+        <Text style={[styles.sectionHeading, { color: colors.text }]}>
+          1. Source Photo
+        </Text>
 
         {selectedImageUri ? (
-          <View style={[styles.selectedPreviewCard, { backgroundColor: colors.surface, borderColor: '#107C61' }]}>
-            <Image source={{ uri: selectedImageUri }} style={styles.selectedPreviewImage} />
-            <View style={styles.selectedPreviewOverlay}>
-              <View style={styles.selectedBadge}>
-                <Text style={styles.selectedBadgeText}>✓ Photo Ready</Text>
-              </View>
+          <View
+            style={[
+              styles.sourceCard,
+              { backgroundColor: colors.surface, borderColor: colors.border },
+            ]}
+          >
+            <Image source={{ uri: selectedImageUri }} style={styles.sourcePreviewImage} />
+            <View style={styles.sourceFooter}>
+              <Text style={[styles.sourceMetaText, { color: colors.textMuted }]} numberOfLines={1}>
+                {selectedImageMeta ? `Photo selected (${selectedImageMeta})` : 'Photo selected'}
+              </Text>
               <TouchableOpacity
-                style={styles.removeImageBtn}
-                onPress={() => setSelectedImageUri(null)}
+                style={styles.changePhotoBtn}
+                onPress={handleClearSourcePhoto}
                 activeOpacity={0.8}
               >
-                <Text style={styles.removeImageBtnText}>✕ Change</Text>
+                <Text style={styles.changePhotoBtnText}>Change Photo</Text>
               </TouchableOpacity>
             </View>
           </View>
         ) : (
-          <>
+          <View style={styles.mediaRow}>
             <TouchableOpacity
-              style={[styles.mediaButton, { backgroundColor: '#107C61' }]}
+              style={[styles.mediaHalfButton, { backgroundColor: '#107C61' }]}
               onPress={handleOpenCamera}
               activeOpacity={0.8}
             >
               <Text style={styles.mediaButtonIcon}>📷</Text>
-              <Text style={styles.mediaButtonText}>Open Camera</Text>
+              <Text style={styles.mediaButtonText}>Camera</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={[styles.mediaButtonGallery, { backgroundColor: colors.surface, borderColor: colors.border }]}
+              style={[
+                styles.mediaHalfButton,
+                { backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1 },
+              ]}
               onPress={handleOpenGallery}
               activeOpacity={0.8}
             >
               <Text style={styles.mediaButtonIcon}>🖼️</Text>
-              <Text style={[styles.mediaButtonTextGallery, { color: colors.text }]}>Choose from Gallery</Text>
+              <Text style={[styles.mediaButtonTextGallery, { color: colors.text }]}>
+                Gallery
+              </Text>
             </TouchableOpacity>
-          </>
+          </View>
         )}
 
-        <Text style={[styles.sectionHeading, { color: colors.text, marginTop: 14 }]}>Select AI Style</Text>
+        <Text style={[styles.sectionHeading, { color: colors.text, marginTop: 10 }]}>
+          2. Edit Requirements
+        </Text>
+        <TextInput
+          style={[
+            styles.requirementsInput,
+            {
+              backgroundColor: colors.surface,
+              color: colors.text,
+              borderColor: colors.border,
+            },
+          ]}
+          placeholder="Write exact edits you want (e.g., bright warm lighting, soft studio portrait, sharp details)..."
+          placeholderTextColor={colors.textMuted}
+          value={editRequirements}
+          onChangeText={setEditRequirements}
+          multiline
+        />
 
-        <View style={styles.stylesGridContainer}>
-          {STYLES.map((item) => {
-            const isSelected = selectedStyle === item.id;
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.quickChipsRow}
+        >
+          {QUICK_REQUIREMENTS.map((chip) => (
+            <TouchableOpacity
+              key={chip}
+              style={[
+                styles.quickChip,
+                { backgroundColor: colors.surface, borderColor: colors.border },
+              ]}
+              onPress={() => appendQuickRequirement(chip)}
+              activeOpacity={0.75}
+            >
+              <Text style={[styles.quickChipText, { color: colors.text }]}>+ {chip}</Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+
+        <Text style={[styles.sectionHeading, { color: colors.text, marginTop: 12 }]}>
+          3. Optional Style
+        </Text>
+        <Text style={[styles.presetSub, { color: colors.textMuted, marginBottom: 8 }]}>
+          Your written instructions always take priority.
+        </Text>
+
+        <View style={styles.presetsGrid}>
+          <TouchableOpacity
+            style={[
+              styles.presetCard,
+              {
+                backgroundColor: colors.surface,
+                borderColor: selectedPresetId === null ? colors.primary : colors.border,
+                borderWidth: selectedPresetId === null ? 2 : 1,
+              },
+            ]}
+            onPress={() => setSelectedPresetId(null)}
+            activeOpacity={0.85}
+          >
+            <Text style={[styles.presetName, { color: colors.text }]} numberOfLines={1}>
+              My Instructions
+            </Text>
+            <Text style={[styles.presetSub, { color: colors.textMuted }]} numberOfLines={1}>
+              No extra style
+            </Text>
+          </TouchableOpacity>
+          {EDIT_PRESETS.map((preset) => {
+            const active = selectedPresetId === preset.id;
             return (
               <TouchableOpacity
-                key={item.id}
+                key={preset.id}
                 style={[
-                  styles.styleBoxCard,
+                  styles.presetCard,
                   {
                     backgroundColor: colors.surface,
-                    borderColor: isSelected ? '#107C61' : colors.border,
-                    borderWidth: isSelected ? 2 : 1,
+                    borderColor: active ? preset.accentColor : colors.border,
+                    borderWidth: active ? 2 : 1,
                   },
                 ]}
-                onPress={() => setSelectedStyle(item.id)}
+                onPress={() => setSelectedPresetId(preset.id)}
                 activeOpacity={0.85}
               >
-                <Text style={[styles.styleBoxName, { color: colors.text }]}>{item.name}</Text>
-                <Text style={[styles.styleBoxTag, { color: colors.textMuted }]}>{item.tag}</Text>
-                {isSelected && <Text style={styles.selectedIndicator}>✓ Active</Text>}
+                <Text style={[styles.presetName, { color: colors.text }]} numberOfLines={1}>
+                  {preset.name}
+                </Text>
+                <Text style={[styles.presetSub, { color: colors.textMuted }]} numberOfLines={1}>
+                  {preset.subtitle}
+                </Text>
               </TouchableOpacity>
             );
           })}
@@ -323,48 +696,156 @@ export default function NanoBananaScreen({ onBack, libraryItems, onUpdateLibrary
 
         <TouchableOpacity
           style={[
-            styles.generateButton,
-            { backgroundColor: selectedImageUri ? '#107C61' : '#334155' },
+            styles.applyButton,
+            {
+              backgroundColor:
+                selectedImageUri && editRequirements.trim()
+                  ? activePreset?.accentColor || colors.primary
+                  : '#334155',
+            },
           ]}
-          onPress={handleGenerate}
+          onPress={handleApplyEdit}
+          disabled={isGenerating || isLoadingAd}
           activeOpacity={0.85}
         >
-          <Text style={[styles.generateButtonText, { opacity: selectedImageUri ? 1 : 0.75 }]}>
-            Process with Gemini AI ✨
-          </Text>
+          {isGenerating || isLoadingAd ? (
+            <ActivityIndicator color="#FFFFFF" />
+          ) : (
+            <Text style={styles.applyButtonText}>Apply Edit ✨</Text>
+          )}
         </TouchableOpacity>
 
+        {latestItem && (
+          <View
+            style={[
+              styles.latestCard,
+              { backgroundColor: colors.surface, borderColor: colors.border },
+            ]}
+          >
+            <View style={styles.latestHeaderRow}>
+              <View style={{ flex: 1, marginRight: 8 }}>
+                <Text style={[styles.latestTitle, { color: colors.text }]} numberOfLines={1}>
+                  {latestItem.styleName} • {latestItem.timestamp}
+                </Text>
+                {latestItem.editRequirements && (
+                  <Text
+                    style={[styles.latestRequirementLine, { color: colors.text }]}
+                    numberOfLines={2}
+                  >
+                    {latestItem.editRequirements}
+                  </Text>
+                )}
+              </View>
+              <TouchableOpacity onPress={() => handleDeleteItem(latestItem.id)}>
+                <Text style={styles.deleteLabel}>Delete</Text>
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.beforeAfterRow}>
+              <View style={styles.beforeAfterCol}>
+                <Text style={[styles.paneLabel, { color: colors.textMuted }]}>Before</Text>
+                <Image source={{ uri: latestItem.sourceImageUri }} style={styles.paneImage} />
+              </View>
+              <View style={styles.beforeAfterCol}>
+                <Text
+                  style={[
+                    styles.paneLabel,
+                    { color: latestItem.accentColor || '#107C61' },
+                  ]}
+                >
+                  After
+                </Text>
+                {renderEditedImage(latestItem, styles.paneImage)}
+              </View>
+            </View>
+
+            <Text style={[styles.notesText, { color: colors.textMuted }]} numberOfLines={4}>
+              {latestItem.aiDescription}
+            </Text>
+
+            <View style={styles.latestActionRow}>
+              <TouchableOpacity
+                style={[styles.compactActionBtn, { borderColor: colors.border }]}
+                onPress={() => handleReuseItemSettings(latestItem)}
+                activeOpacity={0.8}
+              >
+                <Text style={[styles.compactActionBtnText, { color: colors.text }]}>
+                  Reuse Edit
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.compactActionBtn, { borderColor: colors.border }]}
+                onPress={() => {
+                  setModalViewMode('compare');
+                  setPreviewItem(latestItem);
+                }}
+                activeOpacity={0.8}
+              >
+                <Text style={[styles.compactActionBtnText, { color: colors.text }]}>
+                  Preview & Share ↗
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
         <View style={styles.libraryHeaderRow}>
-          <Text style={[styles.sectionHeading, { color: colors.text, marginTop: 10 }]}>Generated Library</Text>
+          <Text style={[styles.sectionHeading, { color: colors.text, marginTop: 10 }]}>
+            Saved Edits
+          </Text>
           {libraryItems.length > 0 && (
-            <Text style={[styles.libraryCountText, { color: colors.textMuted }]}>
-              {libraryItems.length} {libraryItems.length === 1 ? 'item' : 'items'}
+            <Text style={[styles.libraryCount, { color: colors.textMuted }]}>
+              {libraryItems.length}
             </Text>
           )}
         </View>
 
         {libraryItems.length === 0 ? (
-          <View style={[styles.libraryEmptyCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-            <Text style={styles.libraryPlaceholderIcon}>🖼️</Text>
-            <Text style={[styles.libraryText, { color: colors.textMuted }]}>No AI transformations yet</Text>
+          <View
+            style={[
+              styles.emptyLibraryCard,
+              { backgroundColor: colors.surface, borderColor: colors.border },
+            ]}
+          >
+            <Text style={[styles.emptyLibraryText, { color: colors.textMuted }]}>
+              No edited photos yet
+            </Text>
           </View>
         ) : (
           <View style={styles.libraryGrid}>
             {libraryItems.map((item) => (
-              <TouchableOpacity
+              <View
                 key={item.id}
-                style={[styles.libraryGridCard, { backgroundColor: colors.surface, borderColor: colors.border }]}
-                onPress={() => setPreviewItem(item)}
-                activeOpacity={0.85}
+                style={[
+                  styles.gridCard,
+                  { backgroundColor: colors.surface, borderColor: colors.border },
+                ]}
               >
-                <Image source={{ uri: item.imageUri }} style={styles.libraryGridImage} />
-                <View style={styles.libraryGridFooter}>
-                  <Text style={[styles.libraryGridStyle, { color: colors.text }]} numberOfLines={1}>
-                    {item.styleName}
-                  </Text>
-                  <Text style={[styles.libraryGridTime, { color: colors.textMuted }]}>{item.timestamp}</Text>
-                </View>
-              </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => {
+                    setModalViewMode('compare');
+                    setPreviewItem(item);
+                  }}
+                  activeOpacity={0.85}
+                >
+                  {renderEditedImage(item, styles.gridImage, false)}
+                  <View style={styles.gridMeta}>
+                    <Text style={[styles.gridTitle, { color: colors.text }]} numberOfLines={1}>
+                      {item.editRequirements || item.styleName}
+                    </Text>
+                    <Text style={[styles.gridSub, { color: colors.textMuted }]} numberOfLines={1}>
+                      {item.styleName} • {item.timestamp}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.gridDeleteBtn, { borderTopColor: colors.border }]}
+                  onPress={() => handleDeleteItem(item.id)}
+                >
+                  <Text style={styles.deleteLabel}>Delete</Text>
+                </TouchableOpacity>
+              </View>
             ))}
           </View>
         )}
@@ -372,22 +853,24 @@ export default function NanoBananaScreen({ onBack, libraryItems, onUpdateLibrary
         <View style={{ height: 110 }} />
       </ScrollView>
 
-      {/* Google Test Ad Banner */}
-      <View style={[styles.googleAdWrapper, { backgroundColor: isDarkMode ? '#0F172A' : '#FFFFFF', borderTopColor: colors.border }]}>
-        <View style={styles.adHeaderBadgeRow}>
-          <View style={styles.adBadge}>
-            <Text style={styles.adBadgeText}>Ad</Text>
-          </View>
-          <Text style={[styles.adBadgeLabel, { color: colors.textMuted }]}>Google Test Ad Unit</Text>
+      {!isAdsBlocked && (
+        <View
+          style={[
+            styles.adWrapper,
+            {
+              backgroundColor: isDarkMode ? '#0F172A' : '#FFFFFF',
+              borderTopColor: colors.border,
+            },
+          ]}
+        >
+          <BannerAd
+            unitId={TestIds.BANNER}
+            size={BannerAdSize.ANCHORED_ADAPTIVE_BANNER}
+            requestOptions={{ requestNonPersonalizedAdsOnly: true }}
+          />
         </View>
-        <BannerAd
-          unitId={TestIds.BANNER}
-          size={BannerAdSize.ANCHORED_ADAPTIVE_BANNER}
-          requestOptions={{ requestNonPersonalizedAdsOnly: true }}
-        />
-      </View>
+      )}
 
-      {/* Result Preview Modal with AI Analysis */}
       <Modal
         visible={previewItem !== null}
         transparent
@@ -395,36 +878,162 @@ export default function NanoBananaScreen({ onBack, libraryItems, onUpdateLibrary
         onRequestClose={() => setPreviewItem(null)}
       >
         <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          <View
+            style={[
+              styles.modalCard,
+              { backgroundColor: colors.surface, borderColor: colors.border },
+            ]}
+          >
             <View style={styles.modalHeader}>
-              <Text style={[styles.modalTitle, { color: colors.text }]}>
-                {previewItem?.styleName} Result ✨
+              <Text style={[styles.modalTitle, { color: colors.text }]} numberOfLines={1}>
+                {previewItem?.styleName}
               </Text>
-              <TouchableOpacity onPress={() => setPreviewItem(null)} style={styles.modalCloseBtn}>
+              <TouchableOpacity
+                onPress={() => setPreviewItem(null)}
+                style={styles.modalCloseBtn}
+              >
                 <Text style={[styles.modalCloseText, { color: colors.textMuted }]}>✕</Text>
               </TouchableOpacity>
             </View>
 
             {previewItem && (
-              <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 400 }}>
-                <Image source={{ uri: previewItem.imageUri }} style={styles.modalResultImage} />
-                <Text style={[styles.modalAiTitle, { color: colors.text }]}>Gemini AI Analysis:</Text>
-                <Text style={[styles.modalAiText, { color: colors.textMuted }]}>
-                  {previewItem.aiDescription}
-                </Text>
-              </ScrollView>
+              <>
+                <View style={styles.modeToggleRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.modeToggleBtn,
+                      {
+                        backgroundColor:
+                          modalViewMode === 'compare'
+                            ? previewItem.accentColor || '#107C61'
+                            : colors.background,
+                        borderColor: colors.border,
+                      },
+                    ]}
+                    onPress={() => setModalViewMode('compare')}
+                  >
+                    <Text
+                      style={[
+                        styles.modeToggleText,
+                        { color: modalViewMode === 'compare' ? '#FFFFFF' : colors.text },
+                      ]}
+                    >
+                      Before / After
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.modeToggleBtn,
+                      {
+                        backgroundColor:
+                          modalViewMode === 'edited'
+                            ? previewItem.accentColor || '#107C61'
+                            : colors.background,
+                        borderColor: colors.border,
+                      },
+                    ]}
+                    onPress={() => setModalViewMode('edited')}
+                  >
+                    <Text
+                      style={[
+                        styles.modeToggleText,
+                        { color: modalViewMode === 'edited' ? '#FFFFFF' : colors.text },
+                      ]}
+                    >
+                      Full Edited
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 410 }}>
+                  {modalViewMode === 'compare' ? (
+                    <View style={styles.beforeAfterRow}>
+                      <View style={styles.beforeAfterCol}>
+                        <Text style={[styles.paneLabel, { color: colors.textMuted }]}>
+                          Before
+                        </Text>
+                        <Image
+                          source={{ uri: previewItem.sourceImageUri }}
+                          style={styles.modalCompareImage}
+                        />
+                      </View>
+                      <View style={styles.beforeAfterCol}>
+                        <Text
+                          style={[
+                            styles.paneLabel,
+                            { color: previewItem.accentColor || '#107C61' },
+                          ]}
+                        >
+                          After
+                        </Text>
+                        {renderEditedImage(previewItem, styles.modalCompareImage)}
+                      </View>
+                    </View>
+                  ) : (
+                    <>
+                      <Text
+                        style={[
+                          styles.paneLabel,
+                          { color: previewItem.accentColor || '#107C61' },
+                        ]}
+                      >
+                        Edited Output
+                      </Text>
+                      {renderEditedImage(previewItem, styles.modalEditedImage)}
+                    </>
+                  )}
+
+                  {previewItem.editRequirements && (
+                    <Text style={[styles.modalReqText, { color: colors.text }]}>
+                      Requirements: {previewItem.editRequirements}
+                    </Text>
+                  )}
+
+                  <Text style={[styles.notesText, { color: colors.textMuted }]}>
+                    {previewItem.aiDescription}
+                  </Text>
+                </ScrollView>
+
+                <View style={styles.modalUtilityRow}>
+                  <TouchableOpacity
+                    style={[styles.utilityPill, { borderColor: colors.border }]}
+                    onPress={() => handleReuseItemSettings(previewItem)}
+                  >
+                    <Text style={[styles.utilityPillText, { color: colors.text }]}>
+                      ↺ Reuse Settings
+                    </Text>
+                  </TouchableOpacity>
+
+                  {onOpenChatWithPrompt && (
+                    <TouchableOpacity
+                      style={[styles.utilityPill, { borderColor: colors.border }]}
+                      onPress={() => handleRefineInChat(previewItem)}
+                    >
+                      <Text style={[styles.utilityPillText, { color: colors.text }]}>
+                        💬 Refine in Chat
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+              </>
             )}
 
-            <View style={styles.modalActionsRow}>
+            <View style={styles.modalActions}>
               <TouchableOpacity
                 style={[styles.modalSecondaryBtn, { borderColor: colors.border }]}
-                onPress={() => previewItem && handleShareArtwork(previewItem)}
+                onPress={() => previewItem && handleShareItem(previewItem)}
               >
-                <Text style={[styles.modalSecondaryBtnText, { color: colors.text }]}>Share ↗</Text>
+                <Text style={[styles.modalSecondaryBtnText, { color: colors.text }]}>
+                  Share ↗
+                </Text>
               </TouchableOpacity>
 
               <TouchableOpacity
-                style={[styles.modalPrimaryBtn, { backgroundColor: '#107C61' }]}
+                style={[
+                  styles.modalPrimaryBtn,
+                  { backgroundColor: previewItem?.accentColor || '#107C61' },
+                ]}
                 onPress={() => setPreviewItem(null)}
               >
                 <Text style={styles.modalPrimaryBtnText}>Done</Text>
@@ -437,7 +1046,7 @@ export default function NanoBananaScreen({ onBack, libraryItems, onUpdateLibrary
       {isGenerating && (
         <View style={styles.fullScreenLoading}>
           <ActivityIndicator size="large" color="#107C61" />
-          <Text style={styles.fullScreenLoadingText}>Processing with Gemini AI...</Text>
+          <Text style={styles.fullScreenLoadingText}>Applying your edits...</Text>
         </View>
       )}
 
@@ -468,115 +1077,245 @@ const styles = StyleSheet.create({
   clearButton: { height: 38, width: 38, justifyContent: 'center', alignItems: 'center' },
   clearButtonEmoji: { fontSize: 18 },
   scrollContent: { padding: 16, paddingBottom: 30 },
-  sectionHeading: { fontSize: 16, fontWeight: '700', marginBottom: 12, marginTop: 4 },
-  mediaButton: {
-    alignItems: 'center',
-    justifyContent: 'center',
+  sectionHeading: { fontSize: 15.5, fontWeight: '700', marginBottom: 10, marginTop: 4 },
+  sourceCard: {
     borderRadius: 14,
-    paddingVertical: 18,
+    borderWidth: 1,
+    overflow: 'hidden',
     marginBottom: 12,
-    elevation: 3,
   },
-  mediaButtonGallery: {
+  sourcePreviewImage: { width: '100%', height: 180, resizeMode: 'cover' },
+  sourceFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  sourceMetaText: { fontSize: 12, fontWeight: '600', flex: 1, marginRight: 8 },
+  changePhotoBtn: {
+    backgroundColor: '#1E293B',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 10,
+  },
+  changePhotoBtnText: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
+  mediaRow: { flexDirection: 'row', gap: 12, marginBottom: 10 },
+  mediaHalfButton: {
+    flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 14,
-    paddingVertical: 18,
-    marginBottom: 12,
+    paddingVertical: 16,
+    elevation: 2,
+  },
+  mediaButtonIcon: { fontSize: 20, marginBottom: 4 },
+  mediaButtonText: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
+  mediaButtonTextGallery: { fontSize: 14, fontWeight: '700' },
+  requirementsInput: {
+    borderRadius: 14,
+    borderWidth: 1,
+    padding: 12,
+    minHeight: 78,
+    fontSize: 13.5,
+    textAlignVertical: 'top',
+    marginBottom: 8,
+  },
+  quickChipsRow: { gap: 8, paddingBottom: 6, marginBottom: 4 },
+  quickChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
     borderWidth: 1,
   },
-  mediaButtonIcon: { fontSize: 22, marginBottom: 6 },
-  mediaButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
-  mediaButtonTextGallery: { fontSize: 15, fontWeight: '700' },
-  selectedPreviewCard: {
-    width: '100%',
-    height: 175,
-    borderRadius: 14,
-    overflow: 'hidden',
-    borderWidth: 2,
+  quickChipText: { fontSize: 11.5, fontWeight: '600' },
+  presetsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
     marginBottom: 12,
   },
-  selectedPreviewImage: { width: '100%', height: '100%', resizeMode: 'cover' },
-  selectedPreviewOverlay: {
-    position: 'absolute',
-    top: 10,
-    left: 10,
-    right: 10,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
+  presetCard: {
+    width: '48.5%',
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 10,
   },
-  selectedBadge: { backgroundColor: 'rgba(16, 124, 97, 0.92)', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 12 },
-  selectedBadgeText: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
-  removeImageBtn: { backgroundColor: 'rgba(15, 23, 42, 0.85)', paddingHorizontal: 12, paddingVertical: 5, borderRadius: 12 },
-  removeImageBtnText: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
-  stylesGridContainer: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginBottom: 16 },
-  styleBoxCard: { width: '48%', borderRadius: 14, padding: 14, marginBottom: 10 },
-  styleBoxName: { fontSize: 13, fontWeight: '700', marginBottom: 2 },
-  styleBoxTag: { fontSize: 11 },
-  selectedIndicator: { position: 'absolute', top: 8, right: 8, fontSize: 10, fontWeight: 'bold', color: '#107C61' },
-  generateButton: {
+  presetName: { fontSize: 13.5, fontWeight: '700', marginBottom: 2 },
+  presetSub: { fontSize: 11.5 },
+  applyButton: {
     borderRadius: 14,
     paddingVertical: 15,
     alignItems: 'center',
     justifyContent: 'center',
     alignSelf: 'center',
-    width: '80%',
+    width: '86%',
     marginBottom: 16,
     elevation: 4,
   },
-  generateButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
-  libraryHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  libraryCountText: { fontSize: 12, fontWeight: '600' },
-  libraryEmptyCard: {
+  applyButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
+  latestCard: {
+    borderRadius: 16,
+    borderWidth: 1,
+    padding: 14,
+    marginBottom: 12,
+  },
+  latestHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 10,
+  },
+  latestTitle: { fontSize: 14, fontWeight: '700' },
+  latestRequirementLine: { fontSize: 12.5, fontWeight: '600', marginTop: 3 },
+  deleteLabel: { color: '#EF4444', fontSize: 12, fontWeight: '700' },
+  beforeAfterRow: { flexDirection: 'row', gap: 10, marginBottom: 10 },
+  beforeAfterCol: { flex: 1 },
+  paneLabel: { fontSize: 11.5, fontWeight: '700', marginBottom: 5 },
+  paneImage: { width: '100%', height: 126, borderRadius: 10, resizeMode: 'cover' },
+  imageHolder: { position: 'relative' },
+  imageLoadingBadge: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.65)',
+    borderRadius: 12,
+    padding: 6,
+  },
+  imageFallbackBar: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(15, 23, 42, 0.85)',
+    paddingVertical: 5,
+    paddingHorizontal: 8,
+    borderBottomLeftRadius: 10,
+    borderBottomRightRadius: 10,
+  },
+  imageFallbackText: { color: '#FFFFFF', fontSize: 10, fontWeight: '600', textAlign: 'center' },
+  notesText: { fontSize: 12.5, lineHeight: 18 },
+  latestActionRow: { flexDirection: 'row', gap: 10, marginTop: 10 },
+  compactActionBtn: {
+    flex: 1,
+    paddingVertical: 9,
+    borderRadius: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+  },
+  compactActionBtnText: { fontSize: 12, fontWeight: '700' },
+  libraryHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  libraryCount: { fontSize: 12.5, fontWeight: '700' },
+  emptyLibraryCard: {
     width: '100%',
-    height: 95,
+    height: 80,
     borderRadius: 14,
+    borderWidth: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    borderWidth: 1,
   },
-  libraryPlaceholderIcon: { fontSize: 24, opacity: 0.45 },
-  libraryText: { fontSize: 12, fontWeight: '500', marginTop: 6 },
-  libraryGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
-  libraryGridCard: { width: '48%', borderRadius: 14, overflow: 'hidden', borderWidth: 1, marginBottom: 12 },
-  libraryGridImage: { width: '100%', height: 135, resizeMode: 'cover' },
-  libraryGridFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 10, paddingVertical: 8 },
-  libraryGridStyle: { fontSize: 12, fontWeight: '700', flex: 1 },
-  libraryGridTime: { fontSize: 10, fontWeight: '500' },
-  googleAdWrapper: {
+  emptyLibraryText: { fontSize: 12.5, fontWeight: '500' },
+  libraryGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+  },
+  gridCard: {
+    width: '48.5%',
+    borderRadius: 14,
+    borderWidth: 1,
+    overflow: 'hidden',
+    marginBottom: 12,
+  },
+  gridImage: { width: '100%', height: 132, resizeMode: 'cover' },
+  gridMeta: { paddingHorizontal: 10, paddingVertical: 8 },
+  gridTitle: { fontSize: 12.5, fontWeight: '700' },
+  gridSub: { fontSize: 11, marginTop: 2 },
+  gridDeleteBtn: {
+    borderTopWidth: 1,
+    paddingVertical: 7,
+    alignItems: 'center',
+  },
+  adWrapper: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
     borderTopWidth: 1,
-    paddingTop: 6,
-    paddingBottom: 8,
+    paddingTop: 4,
+    paddingBottom: 6,
     alignItems: 'center',
     justifyContent: 'center',
-    elevation: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -3 },
-    shadowOpacity: 0.15,
-    shadowRadius: 5,
   },
-  adHeaderBadgeRow: { flexDirection: 'row', alignItems: 'center', width: '100%', paddingHorizontal: 16, marginBottom: 4 },
-  adBadge: { backgroundColor: '#F59E0B', paddingHorizontal: 5, paddingVertical: 1, borderRadius: 3, marginRight: 6 },
-  adBadgeText: { fontSize: 9, fontWeight: 'bold', color: '#000000' },
-  adBadgeLabel: { fontSize: 10, fontWeight: '600' },
-  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0, 0, 0, 0.85)', justifyContent: 'center', alignItems: 'center', padding: 20 },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.85)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
   modalCard: { width: '100%', borderRadius: 20, borderWidth: 1, padding: 16 },
-  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
-  modalTitle: { fontSize: 17, fontWeight: '700' },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  modalTitle: { fontSize: 17, fontWeight: '700', flex: 1 },
   modalCloseBtn: { padding: 4 },
   modalCloseText: { fontSize: 18, fontWeight: 'bold' },
-  modalResultImage: { width: '100%', height: 210, borderRadius: 14, resizeMode: 'cover', marginBottom: 12 },
-  modalAiTitle: { fontSize: 14, fontWeight: '700', marginBottom: 4 },
-  modalAiText: { fontSize: 13, lineHeight: 18, marginBottom: 14 },
-  modalActionsRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 10, marginTop: 10 },
-  modalSecondaryBtn: { flex: 1, paddingVertical: 12, borderRadius: 12, borderWidth: 1, alignItems: 'center' },
+  modeToggleRow: { flexDirection: 'row', gap: 8, marginBottom: 12 },
+  modeToggleBtn: {
+    flex: 1,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+  },
+  modeToggleText: { fontSize: 12, fontWeight: '700' },
+  modalCompareImage: {
+    width: '100%',
+    height: 165,
+    borderRadius: 12,
+    resizeMode: 'cover',
+    marginBottom: 8,
+  },
+  modalEditedImage: {
+    width: '100%',
+    height: 220,
+    borderRadius: 14,
+    resizeMode: 'cover',
+    marginBottom: 12,
+  },
+  modalReqText: { fontSize: 12.5, fontWeight: '700', marginTop: 4, marginBottom: 8 },
+  modalUtilityRow: { flexDirection: 'row', gap: 8, marginTop: 10 },
+  utilityPill: {
+    flex: 1,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+  },
+  utilityPillText: { fontSize: 11.5, fontWeight: '700' },
+  modalActions: { flexDirection: 'row', gap: 10, marginTop: 10 },
+  modalSecondaryBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    alignItems: 'center',
+  },
   modalSecondaryBtnText: { fontSize: 14, fontWeight: '700' },
-  modalPrimaryBtn: { flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: 'center' },
+  modalPrimaryBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 12,
+    alignItems: 'center',
+  },
   modalPrimaryBtnText: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
   fullScreenLoading: {
     position: 'absolute',

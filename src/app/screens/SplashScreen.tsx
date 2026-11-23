@@ -1,8 +1,7 @@
 // src/app/screens/SplashScreen.tsx
 
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { StyleSheet, Text, View, StatusBar, Image, ActivityIndicator } from 'react-native';
-// Relative path use kiya hai taaki module resolution ka koi issue na aaye
 import { useTheme } from '../../app-kit/theme/useTheme';
 import { AnalyticsManager } from '../../app-kit/services/AnalyticsManager';
 
@@ -11,30 +10,43 @@ interface SplashScreenProps {
 }
 
 export default function SplashScreen({ onFinish }: SplashScreenProps) {
-  const { colors } = useTheme();
+  const { colors, isDarkMode } = useTheme();
+  const onFinishRef = useRef(onFinish);
+
+  useEffect(() => {
+    onFinishRef.current = onFinish;
+  }, [onFinish]);
 
   useEffect(() => {
     try {
       AnalyticsManager.logEvent('splash_screen_viewed');
-    } catch (e) {
-      // Fallback agar analytics init na ho
+    } catch {
+      // Fallback if analytics is not initialized yet
     }
 
     const timer = setTimeout(() => {
-      onFinish();
+      onFinishRef.current();
     }, 2000);
 
     return () => clearTimeout(timer);
-  }, [onFinish]);
+  }, []);
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
-      <StatusBar barStyle="light-content" backgroundColor={colors.background} />
-      
+      <StatusBar
+        barStyle={isDarkMode ? 'light-content' : 'dark-content'}
+        backgroundColor={colors.background}
+      />
+
       <View style={styles.contentContainer}>
-        <View style={[styles.logoBox, { backgroundColor: colors.surface, borderColor: colors.primary }]}>
-          <Image 
-            source={require('../assets/chat-bot.jpg')} 
+        <View
+          style={[
+            styles.logoBox,
+            { backgroundColor: colors.surface, borderColor: colors.primary },
+          ]}
+        >
+          <Image
+            source={require('../assets/chat-bot.jpg')}
             style={styles.logoImage}
             resizeMode="contain"
           />
@@ -45,7 +57,9 @@ export default function SplashScreen({ onFinish }: SplashScreenProps) {
 
       <View style={styles.loaderContainer}>
         <ActivityIndicator size="small" color={colors.primary} />
-        <Text style={[styles.loaderText, { color: colors.textMuted }]}>Initializing experience...</Text>
+        <Text style={[styles.loaderText, { color: colors.textMuted }]}>
+          Initializing experience...
+        </Text>
       </View>
     </View>
   );
