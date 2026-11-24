@@ -13,8 +13,14 @@ import {
   ActivityIndicator,
   Alert,
   Share,
+  Modal,
+  Dimensions,
+  Platform,
+  PermissionsAndroid,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { CameraRoll } from '@react-native-camera-roll/camera-roll';
+import RNFS from 'react-native-fs';
 import {
   BannerAd,
   BannerAdSize,
@@ -43,6 +49,145 @@ interface ImageGeneratorScreenProps {
 const STORAGE_KEY = '@ai_chat_assistant:generated_images_v1';
 const VISUAL_STYLES = ['Photorealistic', '3D Render', 'Digital Art', 'Minimalist'];
 const ASPECT_RATIOS = ['1:1', '16:9', '9:16'];
+const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
+
+async function requestGallerySavePermission(): Promise<boolean> {
+  if (Platform.OS !== 'android') {
+    return true;
+  }
+
+  const sdkVersion =
+    typeof Platform.Version === 'number'
+      ? Platform.Version
+      : parseInt(String(Platform.Version), 10) || 0;
+
+  if (sdkVersion >= 29) {
+    return true;
+  }
+
+  const granted = await PermissionsAndroid.request(
+    PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+    {
+      title: 'Storage Permission',
+      message: 'Allow storage permission to download generated images to your gallery.',
+      buttonNeutral: 'Ask Me Later',
+      buttonNegative: 'Cancel',
+      buttonPositive: 'OK',
+    }
+  );
+  return granted === PermissionsAndroid.RESULTS.GRANTED;
+}
+
+function detectImageMimeFromBase64(base64: string, fallback = ''): string {
+  const clean = (base64 || '').trim();
+  if (clean.startsWith('iVBORw0KGgo')) return 'image/png';
+  if (clean.startsWith('/9j/')) return 'image/jpeg';
+  if (clean.startsWith('UklGR')) return 'image/webp';
+
+  const lower = fallback.toLowerCase();
+  if (lower.includes('image/png') || lower.includes('.png')) return 'image/png';
+  if (lower.includes('image/webp') || lower.includes('.webp')) return 'image/webp';
+  if (lower.startsWith('image/')) return fallback.split(';')[0];
+  return 'image/jpeg';
+}
+
+function getImageExtension(mime: string): string {
+  if (mime === 'image/png') return 'png';
+  if (mime === 'image/webp') return 'webp';
+  return 'jpg';
+}
+
+function createTemporaryImagePath(extension: string): string {
+  const uniqueId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${RNFS.CachesDirectoryPath}/generated-image-${uniqueId}.${extension}`;
+}
+
+async function stageImageForGallery(
+  imageUrl: string
+): Promise<{ uri: string; temporaryPath?: string }> {
+  if (imageUrl.startsWith('data:')) {
+    const match = imageUrl.match(/^data:([^;]+);base64,(.*)$/);
+    if (!match) {
+      throw new Error('Invalid image data URI.');
+    }
+    const base64Payload = (match[2] || '').trim();
+    if (!base64Payload) {
+      throw new Error('Image data URI is empty.');
+    }
+    const mime = detectImageMimeFromBase64(base64Payload, match[1]);
+    const temporaryPath = createTemporaryImagePath(getImageExtension(mime));
+    try {
+      await RNFS.writeFile(temporaryPath, base64Payload, 'base64');
+    } catch (error) {
+      if (await RNFS.exists(temporaryPath)) {
+        await RNFS.unlink(temporaryPath);
+      }
+      throw error;
+    }
+    return { uri: `file://${temporaryPath}`, temporaryPath };
+  }
+
+  if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
+    const extensionMatch = imageUrl.match(/\.(png|webp|jpe?g)(?:[?#]|$)/i);
+    const extension = extensionMatch?.[1]?.toLowerCase() || 'jpg';
+    const normalizedExtension = extension === 'jpeg' ? 'jpg' : extension;
+    const temporaryPath = createTemporaryImagePath(normalizedExtension);
+    try {
+      const download = await RNFS.downloadFile({
+        fromUrl: imageUrl,
+        toFile: temporaryPath,
+        headers: { Accept: 'image/jpeg,image/png,image/webp,image/*;q=0.9' },
+      }).promise;
+      if (download.statusCode < 200 || download.statusCode >= 300) {
+        throw new Error(`Failed to download image (${download.statusCode}).`);
+      }
+
+      const file = await RNFS.stat(temporaryPath);
+      if (Number(file.size) <= 0) {
+        throw new Error('Downloaded image is empty.');
+      }
+    } catch (error) {
+      if (await RNFS.exists(temporaryPath)) {
+        await RNFS.unlink(temporaryPath);
+      }
+      throw error;
+    }
+
+    return { uri: `file://${temporaryPath}`, temporaryPath };
+  }
+
+  if (imageUrl.startsWith('file://')) {
+    return { uri: imageUrl };
+  }
+
+  throw new Error('Unsupported image URI.');
+}
+
+async function saveImageDirectlyToGallery(imageUrl: string): Promise<string> {
+  const hasPermission = await requestGallerySavePermission();
+  if (!hasPermission) {
+    throw new Error('Gallery permission was denied.');
+  }
+
+  const stagedImage = await stageImageForGallery(imageUrl);
+  try {
+    return await CameraRoll.save(stagedImage.uri, {
+      type: 'photo',
+      album: 'AI Chat Assistant',
+    });
+  } finally {
+    if (
+      stagedImage.temporaryPath &&
+      await RNFS.exists(stagedImage.temporaryPath)
+    ) {
+      try {
+        await RNFS.unlink(stagedImage.temporaryPath);
+      } catch (error) {
+        console.warn('Unable to remove temporary generated image file.', error);
+      }
+    }
+  }
+}
 
 export default function ImageGeneratorScreen({
   onBack,
@@ -66,9 +211,11 @@ export default function ImageGeneratorScreen({
   const [selectedStyle, setSelectedStyle] = useState('Photorealistic');
   const [selectedRatio, setSelectedRatio] = useState('1:1');
   const [isGenerating, setIsGenerating] = useState(false);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [activeResult, setActiveResult] = useState<GeneratedVisualItem | null>(
     items[0] || null
   );
+  const [enlargedItem, setEnlargedItem] = useState<GeneratedVisualItem | null>(null);
   const [isAdsBlocked, setIsAdsBlocked] = useState<boolean>(() => AdBlockManager.isEnabled());
 
   useEffect(() => {
@@ -146,6 +293,26 @@ export default function ImageGeneratorScreen({
     }
   };
 
+  const handleDownloadImage = async (item: GeneratedVisualItem) => {
+    if (!item.imageUrl || downloadingId) return;
+
+    setDownloadingId(item.id);
+    try {
+      await saveImageDirectlyToGallery(item.imageUrl);
+      Alert.alert(
+        'Downloaded to Gallery',
+        'The generated image has been saved directly to your gallery.'
+      );
+    } catch (error: any) {
+      Alert.alert(
+        'Download Failed',
+        error?.message || 'Unable to save image directly to gallery.'
+      );
+    } finally {
+      setDownloadingId(null);
+    }
+  };
+
   const handleDeleteItem = (id: string) => {
     Alert.alert(
       'Delete Generated Image',
@@ -161,6 +328,9 @@ export default function ImageGeneratorScreen({
             if (activeResult?.id === id) {
               setActiveResult(nextList[0] || null);
             }
+            if (enlargedItem?.id === id) {
+              setEnlargedItem(null);
+            }
           },
         },
       ]
@@ -170,10 +340,14 @@ export default function ImageGeneratorScreen({
   const handleShare = async (item: GeneratedVisualItem) => {
     try {
       await Share.share({
-        message: `Image Generator (${item.style}, ${item.aspectRatio})\nPrompt: ${item.prompt}\n\n${item.creativeSpec}`,
+        message: `Image Generator (${item.style}, ${item.aspectRatio})\nPrompt: ${item.prompt}${
+          item.imageUrl ? `\n${item.imageUrl}` : ''
+        }`,
       });
     } catch {}
   };
+
+  const isCurrentDownloading = activeResult ? downloadingId === activeResult.id : false;
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
@@ -301,18 +475,36 @@ export default function ImageGeneratorScreen({
             </View>
 
             {activeResult.imageUrl && (
-              <Image
-                source={{ uri: activeResult.imageUrl }}
-                style={styles.previewImage}
-                resizeMode="cover"
-              />
+              <TouchableOpacity
+                activeOpacity={0.88}
+                onPress={() => setEnlargedItem(activeResult)}
+              >
+                <Image
+                  source={{ uri: activeResult.imageUrl }}
+                  style={styles.previewImage}
+                  resizeMode="cover"
+                />
+              </TouchableOpacity>
             )}
 
-            <Text style={[styles.specText, { color: colors.textMuted }]}>
-              {activeResult.creativeSpec}
-            </Text>
-
             <View style={styles.actionRow}>
+              <TouchableOpacity
+                style={[
+                  styles.downloadBtn,
+                  { backgroundColor: colors.primary },
+                  isCurrentDownloading && { opacity: 0.7 },
+                ]}
+                onPress={() => handleDownloadImage(activeResult)}
+                disabled={isCurrentDownloading}
+                activeOpacity={0.85}
+              >
+                {isCurrentDownloading ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.downloadBtnText}>Download</Text>
+                )}
+              </TouchableOpacity>
+
               <TouchableOpacity
                 style={[styles.shareBtn, { borderColor: colors.border, flex: 1 }]}
                 onPress={() => handleShare(activeResult)}
@@ -366,6 +558,63 @@ export default function ImageGeneratorScreen({
 
         <View style={{ height: 95 }} />
       </ScrollView>
+
+      <Modal
+        visible={enlargedItem !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setEnlargedItem(null)}
+      >
+        <View style={styles.enlargedBackdrop}>
+          <View style={styles.enlargedTopBar}>
+            <TouchableOpacity
+              style={styles.enlargedCloseBtn}
+              onPress={() => setEnlargedItem(null)}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.enlargedCloseText}>✕ Close</Text>
+            </TouchableOpacity>
+            {enlargedItem && (
+              <View style={styles.enlargedRightActions}>
+                <TouchableOpacity
+                  style={[styles.enlargedCloseBtn, { backgroundColor: colors.primary }]}
+                  onPress={() => handleDownloadImage(enlargedItem)}
+                  disabled={downloadingId === enlargedItem.id}
+                  activeOpacity={0.8}
+                >
+                  {downloadingId === enlargedItem.id ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Text style={styles.enlargedCloseText}>Download</Text>
+                  )}
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.enlargedCloseBtn}
+                  onPress={() => handleShare(enlargedItem)}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.enlargedCloseText}>Share ↗</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+
+          {enlargedItem?.imageUrl && (
+            <TouchableOpacity
+              activeOpacity={1}
+              style={styles.enlargedImageContainer}
+              onPress={() => setEnlargedItem(null)}
+            >
+              <Image
+                source={{ uri: enlargedItem.imageUrl }}
+                style={styles.enlargedImage}
+                resizeMode="contain"
+              />
+            </TouchableOpacity>
+          )}
+        </View>
+      </Modal>
 
       {!isAdsBlocked && (
         <View
@@ -444,8 +693,16 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     backgroundColor: '#1E293B',
   },
-  specText: { fontSize: 13, lineHeight: 19 },
-  actionRow: { flexDirection: 'row', gap: 10, marginTop: 12 },
+  actionRow: { flexDirection: 'row', gap: 8, marginTop: 4, alignItems: 'center' },
+  downloadBtn: {
+    paddingHorizontal: 13,
+    paddingVertical: 10,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 104,
+  },
+  downloadBtnText: { color: '#FFFFFF', fontSize: 13, fontWeight: '700' },
   shareBtn: {
     paddingVertical: 10,
     borderRadius: 12,
@@ -454,14 +711,14 @@ const styles = StyleSheet.create({
   },
   shareBtnText: { fontSize: 13, fontWeight: '700' },
   deleteBtn: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingVertical: 10,
     borderRadius: 12,
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  deleteBtnText: { color: '#EF4444', fontSize: 13, fontWeight: '700' },
+  deleteBtnText: { color: '#EF4444', fontSize: 12.5, fontWeight: '700' },
   savedSection: { marginTop: 16 },
   savedRow: {
     flexDirection: 'row',
@@ -475,6 +732,50 @@ const styles = StyleSheet.create({
   savedPrompt: { fontSize: 13, fontWeight: '600' },
   savedMeta: { fontSize: 11, marginTop: 2 },
   savedDeleteText: { color: '#EF4444', fontSize: 12, fontWeight: '700' },
+  enlargedBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.94)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 16,
+  },
+  enlargedTopBar: {
+    position: 'absolute',
+    top: 44,
+    left: 16,
+    right: 16,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    zIndex: 10,
+  },
+  enlargedRightActions: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
+  },
+  enlargedCloseBtn: {
+    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 18,
+  },
+  enlargedCloseText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  enlargedImageContainer: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  enlargedImage: {
+    width: SCREEN_WIDTH - 24,
+    height: SCREEN_HEIGHT * 0.72,
+    borderRadius: 12,
+  },
   googleAdWrapper: {
     position: 'absolute',
     bottom: 0,

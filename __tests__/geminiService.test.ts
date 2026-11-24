@@ -194,7 +194,7 @@ test('falls back to another image model when Gemini rejects the first model quot
   );
 });
 
-test('shows an actionable message when all image-model quotas are unavailable', async () => {
+test('explains that Gemini image editing requires billing when image quota is zero', async () => {
   fetchMock.mockResolvedValue({
     ok: false,
     status: 429,
@@ -206,7 +206,7 @@ test('shows an actionable message when all image-model quotas are unavailable', 
   await expect(
     editImageWithGemini('source-image', 'image/jpeg', 'Remove the background.')
   ).rejects.toThrow(
-    'Gemini image-edit quota is unavailable for this API key. Enable billing or wait for the image quota to reset, then try again.'
+    'Gemini image editing is unavailable because image models have no free-tier quota for this API project. Enable billing on the Google Cloud project linked to this API key, then try again.'
   );
 
   expect(fetchMock).toHaveBeenCalledTimes(2);

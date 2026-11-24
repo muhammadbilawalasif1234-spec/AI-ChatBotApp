@@ -1,6 +1,6 @@
 // src/app/screens/OnboardingScreen.tsx
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   StyleSheet,
   Text,
@@ -13,6 +13,8 @@ import {
   NativeScrollEvent,
   TouchableOpacity,
   ActivityIndicator,
+  Animated,
+  Easing,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { InterstitialAd, AdEventType, TestIds } from 'react-native-google-mobile-ads';
@@ -20,6 +22,7 @@ import { PrimaryButton } from '../../app-kit/components/PrimaryButton';
 import { useTheme } from '../../app-kit/theme/useTheme';
 import { StorageManager } from '../../app-kit/storage/StorageManager';
 import { LocalizationManager } from '../../app-kit/locales/LocalizationManager';
+import { AdBlockManager } from '../../app-kit/ads/AdBlockManager';
 
 interface OnboardingScreenProps {
   onFinish: () => void;
@@ -28,6 +31,10 @@ interface OnboardingScreenProps {
 const { width } = Dimensions.get('window');
 
 export const ONBOARDING_COMPLETED_KEY = 'has_completed_onboarding';
+
+const BUBBLE_COUNT = 4;
+const BUBBLE_STAGGER_DELAY_MS = 160;
+const BUBBLE_DURATION_MS = 420;
 
 // Ensure these exact filenames/extensions match what exists in src/app/assets/
 const POET_IMAGE = require('../assets/poet.jpeg');
@@ -43,12 +50,45 @@ export default function OnboardingScreen({ onFinish }: OnboardingScreenProps) {
   const isFinishingRef = useRef(false);
   const { colors } = useTheme();
 
+  const bubbleProgressRef = useRef<Animated.Value[]>(
+    Array.from({ length: BUBBLE_COUNT }, () => new Animated.Value(0))
+  );
+
   useEffect(() => {
     const unsubscribe = LocalizationManager.subscribe(() => {
       setLangVersion((v) => v + 1);
     });
     return () => unsubscribe();
   }, []);
+
+  const runBubbleStaggerAnimation = useCallback(() => {
+    bubbleProgressRef.current.forEach((anim) => {
+      anim.stopAnimation();
+      anim.setValue(0);
+    });
+
+    const animations = bubbleProgressRef.current.map((anim) =>
+      Animated.timing(anim, {
+        toValue: 1,
+        duration: BUBBLE_DURATION_MS,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      })
+    );
+
+    Animated.stagger(BUBBLE_STAGGER_DELAY_MS, animations).start();
+  }, []);
+
+  useEffect(() => {
+    if (currentIndex === 0) {
+      runBubbleStaggerAnimation();
+    } else {
+      bubbleProgressRef.current.forEach((anim) => {
+        anim.stopAnimation();
+        anim.setValue(0);
+      });
+    }
+  }, [currentIndex, runBubbleStaggerAnimation]);
 
   const ONBOARDING_STEPS = [
     {
@@ -96,6 +136,11 @@ export default function OnboardingScreen({ onFinish }: OnboardingScreenProps) {
   ];
 
   const triggerInterstitialAd = (onAdComplete: () => void) => {
+    if (AdBlockManager.isEnabled()) {
+      onAdComplete();
+      return;
+    }
+
     setIsLoadingAd(true);
     try {
       const interstitial = InterstitialAd.createForAdRequest(TestIds.INTERSTITIAL, {
@@ -145,22 +190,6 @@ export default function OnboardingScreen({ onFinish }: OnboardingScreenProps) {
     }
   };
 
-  const handleNext = () => {
-    if (isLoadingAd || isFinishingRef.current) return;
-
-    if (currentIndex < ONBOARDING_STEPS.length - 1) {
-      triggerInterstitialAd(() => {
-        const nextIndex = currentIndex + 1;
-        setCurrentIndex(nextIndex);
-        horizontalScrollRef.current?.scrollTo({ x: nextIndex * width, animated: true });
-      });
-    } else {
-      triggerInterstitialAd(() => {
-        void finishOnboarding();
-      });
-    }
-  };
-
   const finishOnboarding = async () => {
     if (isFinishingRef.current) return;
     isFinishingRef.current = true;
@@ -175,25 +204,74 @@ export default function OnboardingScreen({ onFinish }: OnboardingScreenProps) {
     onFinish();
   };
 
+  const handleNext = () => {
+    if (isLoadingAd || isFinishingRef.current) return;
+
+    if (currentIndex < ONBOARDING_STEPS.length - 1) {
+      const nextIndex = currentIndex + 1;
+      setCurrentIndex(nextIndex);
+      horizontalScrollRef.current?.scrollTo({ x: nextIndex * width, animated: true });
+    } else {
+      triggerInterstitialAd(() => {
+        void finishOnboarding();
+      });
+    }
+  };
+
   const handleScrollEnd = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
     const contentOffsetX = event.nativeEvent.contentOffset.x;
     const selectedIndex = Math.round(contentOffsetX / width);
-    if (selectedIndex !== currentIndex && selectedIndex >= 0 && selectedIndex < ONBOARDING_STEPS.length) {
+    if (
+      selectedIndex !== currentIndex &&
+      selectedIndex >= 0 &&
+      selectedIndex < ONBOARDING_STEPS.length
+    ) {
       setCurrentIndex(selectedIndex);
     }
   };
 
   const renderBubbles = () => (
-    <ScrollView contentContainerStyle={styles.verticalScrollContent} showsVerticalScrollIndicator={false}>
+    <ScrollView
+      contentContainerStyle={styles.verticalScrollContent}
+      showsVerticalScrollIndicator={false}
+    >
       <View style={styles.bubblesContainer}>
         {ONBOARDING_STEPS[0].cards.map((item, index) => {
           const isRight = item.position === 'right';
+          const progress =
+            bubbleProgressRef.current[index] ?? new Animated.Value(1);
+
+          const animatedCardStyle = {
+            opacity: progress,
+            transform: [
+              {
+                translateX: progress.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [isRight ? 28 : -28, 0],
+                }),
+              },
+              {
+                translateY: progress.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [14, 0],
+                }),
+              },
+              {
+                scale: progress.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [0.96, 1],
+                }),
+              },
+            ],
+          };
+
           return (
-            <View
+            <Animated.View
               key={index}
               style={[
                 styles.bubbleItemWrapper,
                 isRight ? styles.alignRight : styles.alignLeft,
+                animatedCardStyle,
               ]}
             >
               <View
@@ -225,7 +303,7 @@ export default function OnboardingScreen({ onFinish }: OnboardingScreenProps) {
               >
                 <Text style={[styles.promptText, { color: colors.text }]}>{item.prompt}</Text>
               </View>
-            </View>
+            </Animated.View>
           );
         })}
       </View>
@@ -233,7 +311,10 @@ export default function OnboardingScreen({ onFinish }: OnboardingScreenProps) {
   );
 
   const renderGridImages = (cards: any[]) => (
-    <ScrollView contentContainerStyle={styles.verticalScrollContent} showsVerticalScrollIndicator={false}>
+    <ScrollView
+      contentContainerStyle={styles.verticalScrollContent}
+      showsVerticalScrollIndicator={false}
+    >
       <View style={styles.gridImagesContainer}>
         {cards.map((item, index) => (
           <View key={index} style={[styles.gridImageCard, { borderColor: colors.border }]}>
@@ -275,13 +356,11 @@ export default function OnboardingScreen({ onFinish }: OnboardingScreenProps) {
       <StatusBar barStyle="light-content" backgroundColor="#000000" />
 
       <View style={styles.topHeaderContainer}>
-        {currentIndex < ONBOARDING_STEPS.length - 1 ? (
+        {currentIndex === 0 ? (
           <TouchableOpacity
             onPress={() => {
               if (!isLoadingAd && !isFinishingRef.current) {
-                triggerInterstitialAd(() => {
-                  void finishOnboarding();
-                });
+                void finishOnboarding();
               }
             }}
             style={styles.skipButton}
@@ -302,8 +381,12 @@ export default function OnboardingScreen({ onFinish }: OnboardingScreenProps) {
         scrollEnabled={!isLoadingAd}
       >
         <View style={[styles.pageContainer, { width }]}>{renderBubbles()}</View>
-        <View style={[styles.pageContainer, { width }]}>{renderGridImages(ONBOARDING_STEPS[1].cards)}</View>
-        <View style={[styles.pageContainer, { width }]}>{renderGridCategories(ONBOARDING_STEPS[2].cards)}</View>
+        <View style={[styles.pageContainer, { width }]}>
+          {renderGridImages(ONBOARDING_STEPS[1].cards)}
+        </View>
+        <View style={[styles.pageContainer, { width }]}>
+          {renderGridCategories(ONBOARDING_STEPS[2].cards)}
+        </View>
       </ScrollView>
 
       <View
@@ -358,6 +441,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingTop: 12,
     paddingBottom: 6,
+    minHeight: 46,
     zIndex: 10,
   },
   skipButton: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 16 },

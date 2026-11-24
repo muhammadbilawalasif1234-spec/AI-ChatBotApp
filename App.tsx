@@ -44,6 +44,7 @@ interface ActiveChatConfig {
 
 const IMAGE_GENERATOR_STORAGE_KEY = '@ai_chat_assistant:generated_images_v1';
 const NANO_BANANA_STORAGE_KEY = '@ai_chat_assistant:nano_banana_library_v1';
+const CHAT_SESSIONS_STORAGE_KEY = '@ai_chat_assistant:chat_sessions_v1';
 const LAUNCH_COUNT_STORAGE_KEY = 'app_launch_count';
 
 function initializeLocalGeminiKey(): void {
@@ -111,6 +112,16 @@ function MainNavigator() {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
           setNanoBananaLibrary(parsed);
+        }
+      })
+      .catch(() => {});
+
+    AsyncStorage.getItem(CHAT_SESSIONS_STORAGE_KEY)
+      .then((raw) => {
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          setChatSessions(parsed);
         }
       })
       .catch(() => {});
@@ -247,10 +258,14 @@ function MainNavigator() {
   }, []);
 
   const handleUpdateMessages = useCallback((topicKey: string, newMessages: Message[]) => {
-    setChatSessions((prev) => ({
-      ...prev,
-      [topicKey]: newMessages,
-    }));
+    setChatSessions((prev) => {
+      const nextSessions = {
+        ...prev,
+        [topicKey]: newMessages,
+      };
+      AsyncStorage.setItem(CHAT_SESSIONS_STORAGE_KEY, JSON.stringify(nextSessions)).catch(() => {});
+      return nextSessions;
+    });
   }, []);
 
   const activeTopicKey = activeChat.topic || 'AI Chat Assistant';
@@ -285,6 +300,7 @@ function MainNavigator() {
             onOpenPremium={() => setCurrentScreen('premium')}
             onOpenNanoBanana={() => setCurrentScreen('nanobanana')}
             onOpenImageGenerator={() => setCurrentScreen('imagegenerator')}
+            chatSessions={chatSessions}
           />
         )}
         {currentScreen === 'chat' && (

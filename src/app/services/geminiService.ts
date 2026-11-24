@@ -479,7 +479,7 @@ export async function editImageWithGemini(
 
   if (quotaExceeded) {
     throw new Error(
-      'Gemini image-edit quota is unavailable for this API key. Enable billing or wait for the image quota to reset, then try again.'
+      'Gemini image editing is unavailable because image models have no free-tier quota for this API project. Enable billing on the Google Cloud project linked to this API key, then try again.'
     );
   }
   if (rateLimited) {

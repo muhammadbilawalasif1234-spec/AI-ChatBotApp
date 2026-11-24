@@ -1,12 +1,14 @@
 // src/app/screens/LanguageScreen.tsx
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   StyleSheet,
   Text,
   View,
   StatusBar,
   TouchableOpacity,
+  Animated,
+  Easing,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
@@ -42,42 +44,75 @@ const LANGUAGES: Language[] = [
 export const SELECTED_LANGUAGE_KEY = 'selected_language';
 export const INITIAL_LANGUAGE_DONE_KEY = 'has_completed_initial_language';
 
+function persistLanguageInBackground(langId: string, markInitialDone = false): void {
+  try {
+    LocalizationManager.setLanguage(langId);
+  } catch {}
+
+  const tasks: Promise<unknown>[] = [
+    StorageManager.setItem(SELECTED_LANGUAGE_KEY, langId).catch(() => {}),
+    AsyncStorage.setItem(SELECTED_LANGUAGE_KEY, langId).catch(() => {}),
+  ];
+
+  if (markInitialDone) {
+    tasks.push(
+      StorageManager.setItem(INITIAL_LANGUAGE_DONE_KEY, 'true').catch(() => {}),
+      AsyncStorage.setItem(INITIAL_LANGUAGE_DONE_KEY, 'true').catch(() => {})
+    );
+  }
+
+  void Promise.allSettled(tasks);
+}
+
 export default function LanguageScreen({ onNext }: LanguageScreenProps) {
-  const [selectedLang, setSelectedLang] = useState(LocalizationManager.getLanguage());
-  const [isAdsBlocked, setIsAdsBlocked] = useState<boolean>(() => AdBlockManager.isEnabled());
+  const [selectedLang, setSelectedLang] = useState(
+    LocalizationManager.getLanguage() || 'en'
+  );
+  const [isAdsBlocked, setIsAdsBlocked] = useState<boolean>(() =>
+    AdBlockManager.isEnabled()
+  );
+  const [isAdLoaded, setIsAdLoaded] = useState(false);
+  const adSlideAnim = useRef(new Animated.Value(140)).current;
   const { colors, isDarkMode } = useTheme();
 
   useEffect(() => {
     const unsubscribe = AdBlockManager.subscribe((blocked) => {
       setIsAdsBlocked(blocked);
+      if (blocked) {
+        setIsAdLoaded(false);
+      }
     });
     return () => unsubscribe();
   }, []);
 
-  const persistLanguageChoice = async (langId: string) => {
-    LocalizationManager.setLanguage(langId);
-    try {
-      await Promise.all([
-        StorageManager.setItem(SELECTED_LANGUAGE_KEY, langId),
-        AsyncStorage.setItem(SELECTED_LANGUAGE_KEY, langId),
-      ]);
-    } catch {}
-  };
+  useEffect(() => {
+    if (isAdsBlocked) {
+      setIsAdLoaded(false);
+      adSlideAnim.setValue(140);
+      return;
+    }
 
-  const handleSelectLanguage = async (langId: string) => {
+    if (isAdLoaded) {
+      adSlideAnim.setValue(140);
+      Animated.timing(adSlideAnim, {
+        toValue: 0,
+        duration: 320,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    } else {
+      adSlideAnim.setValue(140);
+    }
+  }, [isAdLoaded, isAdsBlocked, adSlideAnim]);
+
+  const handleSelectLanguage = (langId: string) => {
     setSelectedLang(langId);
-    await persistLanguageChoice(langId);
+    persistLanguageInBackground(langId, false);
   };
 
-  const handleNextPress = async () => {
+  const handleNextPress = () => {
     const langToSave = selectedLang || LocalizationManager.getLanguage() || 'en';
-    await persistLanguageChoice(langToSave);
-    try {
-      await Promise.all([
-        StorageManager.setItem(INITIAL_LANGUAGE_DONE_KEY, 'true'),
-        AsyncStorage.setItem(INITIAL_LANGUAGE_DONE_KEY, 'true'),
-      ]);
-    } catch {}
+    persistLanguageInBackground(langToSave, true);
     onNext();
   };
 
@@ -128,7 +163,9 @@ export default function LanguageScreen({ onNext }: LanguageScreenProps) {
             >
               <View style={styles.langInfo}>
                 <Text style={styles.flagEmoji}>{lang.flag}</Text>
-                <Text style={[styles.langText, { color: colors.text }]}>{lang.name}</Text>
+                <Text style={[styles.langText, { color: colors.text }]}>
+                  {lang.name}
+                </Text>
               </View>
               <View
                 style={[
@@ -137,7 +174,9 @@ export default function LanguageScreen({ onNext }: LanguageScreenProps) {
                 ]}
               >
                 {isSelected && (
-                  <View style={[styles.radioInner, { backgroundColor: colors.primary }]} />
+                  <View
+                    style={[styles.radioInner, { backgroundColor: colors.primary }]}
+                  />
                 )}
               </View>
             </TouchableOpacity>
@@ -145,14 +184,29 @@ export default function LanguageScreen({ onNext }: LanguageScreenProps) {
         })}
       </View>
 
-      {/* Official Google Mobile Ads SDK Test Ad pinned at the bottom when Ads Block is OFF */}
-      {!isAdsBlocked && (
-        <View
+      {/* Keep bottom space empty until loaded; then slide smoothly up from the bottom */}
+      {!isAdsBlocked && !isAdLoaded && (
+        <View style={styles.hiddenAdLoader} pointerEvents="none">
+          <BannerAd
+            unitId={TestIds.BANNER}
+            size={BannerAdSize.ANCHORED_ADAPTIVE_BANNER}
+            requestOptions={{
+              requestNonPersonalizedAdsOnly: true,
+            }}
+            onAdLoaded={() => setIsAdLoaded(true)}
+            onAdFailedToLoad={() => setIsAdLoaded(false)}
+          />
+        </View>
+      )}
+
+      {!isAdsBlocked && isAdLoaded && (
+        <Animated.View
           style={[
             styles.googleAdWrapper,
             {
               backgroundColor: isDarkMode ? '#0F172A' : '#FFFFFF',
               borderTopColor: colors.border,
+              transform: [{ translateY: adSlideAnim }],
             },
           ]}
         >
@@ -170,8 +224,9 @@ export default function LanguageScreen({ onNext }: LanguageScreenProps) {
             requestOptions={{
               requestNonPersonalizedAdsOnly: true,
             }}
+            onAdFailedToLoad={() => setIsAdLoaded(false)}
           />
-        </View>
+        </Animated.View>
       )}
     </View>
   );
@@ -227,21 +282,19 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   radioInner: { width: 12, height: 12, borderRadius: 6 },
-  googleAdWrapper: {
+  hiddenAdLoader: {
     position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
+    width: 1,
+    height: 1,
+    opacity: 0,
+    overflow: 'hidden',
+  },
+  googleAdWrapper: {
     borderTopWidth: 1,
     paddingTop: 6,
     paddingBottom: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    elevation: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -3 },
-    shadowOpacity: 0.15,
-    shadowRadius: 5,
   },
   adHeaderBadgeRow: {
     flexDirection: 'row',

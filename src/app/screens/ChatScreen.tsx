@@ -1,6 +1,6 @@
 // src/app/screens/ChatScreen.tsx
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   StyleSheet,
   Text,
@@ -46,7 +46,6 @@ interface ChatScreenProps {
 export default function ChatScreen({
   onBack,
   initialTopic,
-  starterPrompt,
   messages,
   onUpdateMessages,
 }: ChatScreenProps) {
@@ -59,11 +58,17 @@ export default function ChatScreen({
 
   const flatListRef = useRef<FlatList>(null);
   const isMountedRef = useRef(true);
-  const autoStartedKeyRef = useRef<string | null>(null);
+  const hasScrolledOnEntryRef = useRef(false);
   const activeControllerRef = useRef<AbortController | null>(null);
   const messagesRef = useRef<Message[]>(messages);
 
   messagesRef.current = messages;
+
+  const scrollToLatest = useCallback((animated: boolean) => {
+    requestAnimationFrame(() => {
+      flatListRef.current?.scrollToEnd({ animated });
+    });
+  }, []);
 
   useEffect(() => {
     const unsubscribe = LocalizationManager.subscribe(() => {
@@ -74,16 +79,31 @@ export default function ChatScreen({
 
   useEffect(() => {
     isMountedRef.current = true;
+    hasScrolledOnEntryRef.current = false;
     return () => {
       isMountedRef.current = false;
       activeControllerRef.current?.abort();
     };
   }, []);
 
-  const commitMessages = (nextMessages: Message[]) => {
-    messagesRef.current = nextMessages;
-    onUpdateMessages(nextMessages);
-  };
+  useEffect(() => {
+    if (messages.length > 0 && !hasScrolledOnEntryRef.current) {
+      hasScrolledOnEntryRef.current = true;
+      scrollToLatest(false);
+      const timer = setTimeout(() => {
+        scrollToLatest(false);
+      }, 80);
+      return () => clearTimeout(timer);
+    }
+  }, [messages.length, scrollToLatest]);
+
+  const commitMessages = useCallback(
+    (nextMessages: Message[]) => {
+      messagesRef.current = nextMessages;
+      onUpdateMessages(nextMessages);
+    },
+    [onUpdateMessages]
+  );
 
   const getCurrentFormattedTime = () => {
     const now = new Date();
@@ -97,12 +117,12 @@ export default function ChatScreen({
     return now.toLocaleString('en-US', options);
   };
 
-  const getInitialWelcomeMessage = (topic?: string) => {
+  const getInitialWelcomeMessage = useCallback((topic?: string) => {
     if (!topic) {
       return LocalizationManager.t('defaultWelcome');
     }
     return `**${topic}** — ${LocalizationManager.t('topicReadySuffix')}`;
-  };
+  }, []);
 
   const buildTopicInstruction = (topic?: string) => {
     const lang = LocalizationManager.getLanguage();
@@ -115,16 +135,9 @@ export default function ChatScreen({
   };
 
   useEffect(() => {
-    const sessionKey = `${initialTopic || 'default'}::${starterPrompt || ''}`;
-    if (
-      messagesRef.current.length > 0 ||
-      !starterPrompt ||
-      autoStartedKeyRef.current === sessionKey
-    ) {
+    if (messagesRef.current.length > 0) {
       return;
     }
-
-    autoStartedKeyRef.current = sessionKey;
 
     const welcomeMsg: Message = {
       id: '1',
@@ -133,67 +146,19 @@ export default function ChatScreen({
       timestamp: getCurrentFormattedTime(),
     };
     commitMessages([welcomeMsg]);
-
-    activeControllerRef.current?.abort();
-    const controller = new AbortController();
-    activeControllerRef.current = controller;
-    setLoading(true);
-
-    sendMessageToGemini([{ role: 'user', text: starterPrompt }], {
-      systemInstruction: buildTopicInstruction(initialTopic),
-      signal: controller.signal,
-    })
-      .then((aiResponseText) => {
-        if (!isMountedRef.current || controller.signal.aborted) return;
-        const starterReply: Message = {
-          id: `${Date.now()}_starter`,
-          role: 'model',
-          text: aiResponseText,
-          timestamp: getCurrentFormattedTime(),
-        };
-        const current = messagesRef.current;
-        const hasWelcome = current.some((m) => m.id === '1');
-        commitMessages(
-          hasWelcome ? [...current, starterReply] : [welcomeMsg, starterReply]
-        );
-      })
-      .catch((error: any) => {
-        if (!isMountedRef.current || controller.signal.aborted) return;
-        const errMsg: Message = {
-          id: `${Date.now()}_starter_err`,
-          role: 'model',
-          text: `${LocalizationManager.t('aiServiceErrorPrefix')} (${
-            error?.message || 'Network Error'
-          })`,
-          timestamp: getCurrentFormattedTime(),
-          isError: true,
-          retryPrompt: starterPrompt,
-        };
-        const current = messagesRef.current;
-        const hasWelcome = current.some((m) => m.id === '1');
-        commitMessages(
-          hasWelcome ? [...current, errMsg] : [welcomeMsg, errMsg]
-        );
-      })
-      .finally(() => {
-        if (isMountedRef.current && activeControllerRef.current === controller) {
-          activeControllerRef.current = null;
-          setLoading(false);
-        }
-      });
-  }, [initialTopic, starterPrompt]);
+  }, [initialTopic, commitMessages, getInitialWelcomeMessage]);
 
   useEffect(() => {
     const showEvent =
       Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
     const showSub = Keyboard.addListener(showEvent, () => {
       setTimeout(() => {
-        flatListRef.current?.scrollToEnd({ animated: true });
+        scrollToLatest(true);
       }, 120);
     });
 
     return () => showSub.remove();
-  }, []);
+  }, [scrollToLatest]);
 
   const handleLongPressCopy = (text: string, isError?: boolean) => {
     if (isError || !text.trim()) return;
@@ -220,7 +185,7 @@ export default function ChatScreen({
             activeControllerRef.current?.abort();
             activeControllerRef.current = null;
             setLoading(false);
-            autoStartedKeyRef.current = null;
+            hasScrolledOnEntryRef.current = true;
             const freshMsg: Message = {
               id: '1',
               role: 'model',
@@ -244,7 +209,6 @@ export default function ChatScreen({
     const trimmedPrompt = promptText.trim();
     if (!trimmedPrompt) return;
 
-    // Cancel any previous in-flight request so user messages always proceed immediately
     activeControllerRef.current?.abort();
     const controller = new AbortController();
     activeControllerRef.current = controller;
@@ -259,6 +223,7 @@ export default function ChatScreen({
     const workingMessages = [...baseMessages, userMessage];
     commitMessages(workingMessages);
     setLoading(true);
+    scrollToLatest(true);
 
     try {
       const history: GeminiMessage[] = workingMessages
@@ -280,6 +245,7 @@ export default function ChatScreen({
       };
 
       commitMessages([...messagesRef.current, aiMessage]);
+      scrollToLatest(true);
     } catch (error: any) {
       if (!isMountedRef.current || controller.signal.aborted) return;
 
@@ -294,6 +260,7 @@ export default function ChatScreen({
         retryPrompt: trimmedPrompt,
       };
       commitMessages([...messagesRef.current, errorMessage]);
+      scrollToLatest(true);
     } finally {
       if (isMountedRef.current && activeControllerRef.current === controller) {
         activeControllerRef.current = null;
@@ -464,9 +431,23 @@ export default function ChatScreen({
           renderItem={renderItem}
           contentContainerStyle={styles.listContainer}
           keyboardShouldPersistTaps="handled"
-          onContentSizeChange={() =>
-            flatListRef.current?.scrollToEnd({ animated: true })
-          }
+          onLayout={() => {
+            if (messages.length > 0 && !hasScrolledOnEntryRef.current) {
+              hasScrolledOnEntryRef.current = true;
+              scrollToLatest(false);
+            }
+          }}
+          onContentSizeChange={() => {
+            if (!hasScrolledOnEntryRef.current && messages.length > 0) {
+              hasScrolledOnEntryRef.current = true;
+              scrollToLatest(false);
+            } else {
+              scrollToLatest(true);
+            }
+          }}
+          onScrollToIndexFailed={() => {
+            scrollToLatest(false);
+          }}
         />
 
         {loading && (

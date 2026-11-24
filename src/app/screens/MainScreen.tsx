@@ -1,6 +1,6 @@
 // src/app/screens/MainScreen.tsx
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   StyleSheet,
   Text,
@@ -9,7 +9,6 @@ import {
   ScrollView,
   Image,
   TouchableOpacity,
-  Dimensions,
   ActivityIndicator,
 } from 'react-native';
 import { InterstitialAd, AdEventType, TestIds } from 'react-native-google-mobile-ads';
@@ -17,10 +16,17 @@ import { useTheme } from '../../app-kit/theme/useTheme';
 import { analyticsManager } from '../../app-kit/analytics/AnalyticsManager';
 import { LocalizationManager } from '../../app-kit/locales/LocalizationManager';
 import { AdBlockManager } from '../../app-kit/ads/AdBlockManager';
+import type { Message } from './ChatScreen';
 
 export interface MainCardAction {
   label: string;
-  starterPrompt: string;
+  starterPrompt?: string;
+}
+
+export interface ChatHistoryEntry {
+  topic: string;
+  preview: string;
+  timestamp?: string;
 }
 
 interface MainScreenProps {
@@ -29,9 +35,8 @@ interface MainScreenProps {
   onOpenPremium?: () => void;
   onOpenNanoBanana?: () => void;
   onOpenImageGenerator?: () => void;
+  chatSessions?: Record<string, Message[]>;
 }
-
-const { width } = Dimensions.get('window');
 
 const MAX_ADS_BEFORE_COOLDOWN = 2;
 const AD_COOLDOWN_MS = 30_000;
@@ -66,43 +71,44 @@ function recordInterstitialAdShown(): void {
   }
 }
 
-function buildStarterPromptForLabel(label: string, activeTab: string): string {
-  const clean = label.trim();
-  const lower = clean.toLowerCase();
+const SUGGESTION_TABS = ['Email', 'Business & Marketing', 'Assistant'] as const;
+type SuggestionTab = (typeof SUGGESTION_TABS)[number];
 
-  switch (lower) {
-    case 'chat with ai':
-      return 'Act as a supportive, clear, and helpful AI companion. Greet me warmly and ask what I would like to explore or solve today.';
-    case 'social media':
-      return 'Act as a social media strategist. Give me high-engagement post hooks, content angles, and growth tips for building an active audience.';
-    case 'business ideas':
-      return 'Act as a startup & business advisor. Share 4 practical, low-to-medium investment business ideas with target audience and monetization paths.';
-    case 'language translator':
-      return 'Act as a professional Language Translator and tutor. Ask what text I want translated and which source/target languages to use, and show a quick example.';
-    case 'poet':
-      return 'Act as a expressive Poet. Compose a vivid, evocative short poem and ask what theme, mood, or style I want next.';
-    case 'philosopher':
-      return 'Act as a thoughtful Philosopher. Offer a concise, insightful reflection on meaning, perspective, and decision-making, then invite my question.';
-    case 'smart video':
-      return 'Act as a Smart Video creative director. Give me a structured short-form video concept with hook, visual shots, pacing, and call-to-action.';
-    case 'email promote':
-      return 'Act as an email copywriter. Draft a high-converting promotional email template with subject line options and ask for my product/offer details.';
-    case 'newsletter':
-      return 'Act as a newsletter editor. Provide a clean weekly newsletter structure with an engaging intro, curated highlights, and reader takeaway.';
-    case 'mail response':
-      return 'Act as a communication assistant. Help me write a clear, polite, and effective email reply—ask me what email I received and what outcome I want.';
-    case 'email subject':
-      return 'Act as an email marketing specialist. Generate 6 catchy, high-open-rate email subject lines and ask what campaign I am sending.';
-    case 'marketing email':
-      return 'Act as a conversion copywriter. Write a persuasive marketing email outline focused on customer value, social proof, and a clear CTA.';
-    case 'text formalizer':
-      return 'Act as an editor specializing in formal writing. Show how to turn casual notes into polished, professional language and invite my text.';
-    case 'email responder':
-      return 'Act as a customer & workplace email assistant. Help craft quick, accurate responses for inquiries, follow-ups, or scheduling.';
-    default:
-      return `Focus directly on "${clean}" (context: ${activeTab}). Deliver a helpful, well-structured response tailored to this exact topic right away.`;
-  }
+interface SuggestionCardItem {
+  id: string;
+  title: string;
+  icon: string;
 }
+
+const SUGGESTIONS_BY_TAB: Record<SuggestionTab, SuggestionCardItem[]> = {
+  Email: [
+    { id: 'em-1', title: 'Email Promote', icon: '✉️' },
+    { id: 'em-2', title: 'Newsletter', icon: '📰' },
+    { id: 'em-3', title: 'Mail Response', icon: '📩' },
+    { id: 'em-4', title: 'Email Subject', icon: '📧' },
+    { id: 'em-5', title: 'Marketing Email', icon: '📊' },
+    { id: 'em-6', title: 'Text Formalizer', icon: '📝' },
+    { id: 'em-7', title: 'Email Responder', icon: '💬' },
+  ],
+  'Business & Marketing': [
+    { id: 'bm-1', title: 'Business Ideas', icon: '💡' },
+    { id: 'bm-2', title: 'Pitch Deck', icon: '📑' },
+    { id: 'bm-3', title: 'Ad Copy', icon: '📣' },
+    { id: 'bm-4', title: 'Social Strategy', icon: '📱' },
+    { id: 'bm-5', title: 'Pricing Plan', icon: '💰' },
+    { id: 'bm-6', title: 'Competitor Edge', icon: '🎯' },
+    { id: 'bm-7', title: 'Client Proposal', icon: '🤝' },
+  ],
+  Assistant: [
+    { id: 'as-1', title: 'Translator', icon: '🌐' },
+    { id: 'as-2', title: 'Study Planner', icon: '📚' },
+    { id: 'as-3', title: 'Code Helper', icon: '💻' },
+    { id: 'as-4', title: 'Summarizer', icon: '🧾' },
+    { id: 'as-5', title: 'Brainstormer', icon: '⚡' },
+    { id: 'as-6', title: 'Interview Prep', icon: '🎤' },
+    { id: 'as-7', title: 'Daily Routine', icon: '🗓️' },
+  ],
+};
 
 export default function MainScreen({
   onStartChat,
@@ -110,9 +116,10 @@ export default function MainScreen({
   onOpenPremium,
   onOpenNanoBanana,
   onOpenImageGenerator,
+  chatSessions,
 }: MainScreenProps) {
   const { colors } = useTheme();
-  const [activeTab, setActiveTab] = useState('Email');
+  const [activeTab, setActiveTab] = useState<SuggestionTab>('Email');
   const [isLoadingAd, setIsLoadingAd] = useState(false);
   const [, setLangVersion] = useState(0);
   const isHandlingActionRef = useRef(false);
@@ -142,17 +149,30 @@ export default function MainScreen({
     { id: '3', title: 'Smart Video', subtitle: 'Discover trends, analytics, and insights instantly', image: require('../assets/science_chat.png') },
   ];
 
-  const SUGGESTION_TABS = ['Email', 'Business & Marketing', 'Assistant'];
+  const activeSuggestions = SUGGESTIONS_BY_TAB[activeTab] || SUGGESTIONS_BY_TAB.Email;
 
-  const SUGGESTION_ITEMS = [
-    { id: '1', title: 'Email Promote', icon: '✉️' },
-    { id: '2', title: 'Newsletter', icon: '📰' },
-    { id: '3', title: 'Mail Response', icon: '📩' },
-    { id: '4', title: 'Email Subject', icon: '📧' },
-    { id: '5', title: 'Marketing Email', icon: '📊' },
-    { id: '6', title: 'Text Formalizer', icon: '📝' },
-    { id: '7', title: 'Email Responder', icon: '💬' },
-  ];
+  const recentHistory = useMemo<ChatHistoryEntry[]>(() => {
+    if (!chatSessions) return [];
+
+    const entries: ChatHistoryEntry[] = [];
+    for (const [topic, msgs] of Object.entries(chatSessions)) {
+      if (!Array.isArray(msgs)) continue;
+      const meaningful = msgs.filter(
+        (m) => m && m.id !== '1' && typeof m.text === 'string' && m.text.trim().length > 0
+      );
+      if (meaningful.length === 0) continue;
+
+      const lastMsg = meaningful[meaningful.length - 1];
+      const cleanedPreview = lastMsg.text.replace(/\s+/g, ' ').trim();
+      entries.push({
+        topic,
+        preview: cleanedPreview,
+        timestamp: lastMsg.timestamp,
+      });
+    }
+
+    return entries.slice(-3).reverse();
+  }, [chatSessions]);
 
   const ART_PROMPTS = [
     { id: '1', title: 'Short story about witchcraft', icon: '📖' },
@@ -286,13 +306,14 @@ export default function MainScreen({
       return;
     }
 
-    const action: MainCardAction = {
-      label,
-      starterPrompt: buildStarterPromptForLabel(label, activeTab),
-    };
-
     runWithOptionalInterstitial('main_screen_action_clicked', () => {
-      onStartChat(action);
+      onStartChat(label);
+    });
+  };
+
+  const handleResumeHistory = (topic: string) => {
+    runWithOptionalInterstitial('history_session_resumed', () => {
+      onStartChat(topic);
     });
   };
 
@@ -505,6 +526,7 @@ export default function MainScreen({
                   },
                 ]}
                 onPress={() => setActiveTab(tab)}
+                activeOpacity={0.75}
               >
                 <Text
                   style={[
@@ -520,11 +542,12 @@ export default function MainScreen({
         </ScrollView>
 
         <View style={styles.suggestionGridContainer}>
-          {SUGGESTION_ITEMS.map((item) => (
+          {activeSuggestions.map((item) => (
             <TouchableOpacity
               key={item.id}
               style={styles.suggestionItem}
               onPress={() => handleCardPress(item.title)}
+              activeOpacity={0.75}
             >
               <View
                 style={[
@@ -549,16 +572,48 @@ export default function MainScreen({
             {LocalizationManager.t('history')}
           </Text>
         </View>
-        <View
-          style={[
-            styles.historyCard,
-            { backgroundColor: colors.surface, borderColor: colors.border },
-          ]}
-        >
-          <Text style={[styles.historyText, { color: colors.textMuted }]}>
-            {LocalizationManager.t('noHistory')}
-          </Text>
-        </View>
+        {recentHistory.length === 0 ? (
+          <View
+            style={[
+              styles.historyCard,
+              { backgroundColor: colors.surface, borderColor: colors.border },
+            ]}
+          >
+            <Text style={[styles.historyText, { color: colors.textMuted }]}>
+              {LocalizationManager.t('noHistory')}
+            </Text>
+          </View>
+        ) : (
+          <View style={styles.historyListContainer}>
+            {recentHistory.map((entry) => (
+              <TouchableOpacity
+                key={entry.topic}
+                style={[
+                  styles.historyItemCard,
+                  { backgroundColor: colors.surface, borderColor: colors.border },
+                ]}
+                onPress={() => handleResumeHistory(entry.topic)}
+                activeOpacity={0.75}
+              >
+                <View style={styles.historyItemTop}>
+                  <Text
+                    style={[styles.historyTopicText, { color: colors.text }]}
+                    numberOfLines={1}
+                  >
+                    {entry.topic}
+                  </Text>
+                  <Text style={[styles.arrowIcon, { color: colors.textMuted }]}>↗</Text>
+                </View>
+                <Text
+                  style={[styles.historyPreviewText, { color: colors.textMuted }]}
+                  numberOfLines={1}
+                >
+                  {entry.preview}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
 
         {renderPromptSection('art', '🎨', ART_PROMPTS)}
         {renderPromptSection('travel', '✈️', TRAVEL_PROMPTS)}
@@ -713,6 +768,21 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   historyText: { fontSize: 12, fontWeight: '500' },
+  historyListContainer: { gap: 8 },
+  historyItemCard: {
+    borderRadius: 14,
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    borderWidth: 1,
+  },
+  historyItemTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 3,
+  },
+  historyTopicText: { fontSize: 13, fontWeight: '700', flex: 1, marginRight: 8 },
+  historyPreviewText: { fontSize: 12 },
   promptCard: {
     flexDirection: 'row',
     alignItems: 'center',
